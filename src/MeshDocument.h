@@ -81,6 +81,10 @@ public:
   // Returns the index of the new active node.
   int appendOperation(const QString& label, const QString& details, Mesh&& mesh);
 
+  // Append a freshly imported mesh at the tip without truncating history
+  // and without carrying probes forward. Returns the new active index.
+  int appendSource(const QString& label, Mesh&& mesh);
+
   void setActive(int i);
   // Replace the mesh stored at node i in place (used to refresh a
   // shrinkwrap stage after weight edits without spamming history).

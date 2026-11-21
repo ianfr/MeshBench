@@ -1,7 +1,9 @@
 #include "MainWindow.h"
 #include "LeakFix.h"
 #include "MeshOps.h"
+#include "StageSelection.h"
 
+#include <QAction>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDialog>
@@ -19,6 +21,8 @@
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QShortcut>
+#include <QSignalBlocker>
 #include <QSlider>
 #include <QSpinBox>
 #include <QSplitter>
@@ -28,6 +32,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
 #include <unordered_map>
 
 namespace meshbench {
@@ -39,6 +44,8 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   auto* fileMenu = menuBar()->addMenu(QStringLiteral("&File"));
   fileMenu->addAction(QStringLiteral("Open mesh..."), QKeySequence::Open, this,
                       &MainWindow::openMesh);
+  fileMenu->addAction(QStringLiteral("Import meshes..."), this,
+                      &MainWindow::importMeshes);
   fileMenu->addAction(QStringLiteral("Save active stage..."), QKeySequence::Save,
                       this, &MainWindow::saveActiveMesh);
   fileMenu->addSeparator();
@@ -51,8 +58,13 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
                      &MainWindow::runBoolean);
   opsMenu->addAction(QStringLiteral("Center at volume center"), this,
                      &MainWindow::runCenter);
+  opsMenu->addAction(QStringLiteral("Transform (translate/rotate)..."), this,
+                     &MainWindow::runTransform);
   opsMenu->addAction(QStringLiteral("Alpha wrap..."), this, &MainWindow::runAlphaWrap);
   opsMenu->addAction(QStringLiteral("Slice with plane..."), this, &MainWindow::runClip);
+  opsMenu->addSeparator();
+  opsMenu->addAction(QStringLiteral("Combine selected stages..."), this,
+                     &MainWindow::runCombineSelected);
   opsMenu->addSeparator();
   opsMenu->addAction(QStringLiteral("Detect leaks"), this, &MainWindow::runDetectLeaks);
   opsMenu->addAction(QStringLiteral("Patch holes..."), this, &MainWindow::runPatchHoles);
@@ -68,6 +80,19 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
                      &MainWindow::runGmshRemesh);
 #endif
   auto* viewMenu = menuBar()->addMenu(QStringLiteral("&View"));
+  viewMenu->addAction(QStringLiteral("View from +X"), this,
+                      [this] { m_view->setStandardView(StandardView::PosX); });
+  viewMenu->addAction(QStringLiteral("View from -X"), this,
+                      [this] { m_view->setStandardView(StandardView::NegX); });
+  viewMenu->addAction(QStringLiteral("View from +Y"), this,
+                      [this] { m_view->setStandardView(StandardView::PosY); });
+  viewMenu->addAction(QStringLiteral("View from -Y"), this,
+                      [this] { m_view->setStandardView(StandardView::NegY); });
+  viewMenu->addAction(QStringLiteral("View from +Z"), this,
+                      [this] { m_view->setStandardView(StandardView::PosZ); });
+  viewMenu->addAction(QStringLiteral("View from -Z"), this,
+                      [this] { m_view->setStandardView(StandardView::NegZ); });
+  viewMenu->addSeparator();
   viewMenu->addAction(QStringLiteral("Reset camera"), this,
                       [this] { m_view->resetCamera(); });
 
@@ -76,25 +101,59 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 
   // --- Left: pipeline history sidebar ---
   m_tree = new QTreeWidget(splitter);
-  m_tree->setHeaderLabels({QStringLiteral("Pipeline"), QStringLiteral("Info")});
+  m_tree->setHeaderLabels({QStringLiteral("Pipeline"), QStringLiteral("Info"),
+                           QStringLiteral("Combine")});
   m_tree->setColumnWidth(0, 220);
+  m_tree->setColumnWidth(2, 70);
+  // ParaView-style: several stages can be selected at once (for Combine).
+  m_tree->setSelectionMode(QAbstractItemView::ExtendedSelection);
   m_tree->setContextMenuPolicy(Qt::CustomContextMenu);
   connect(m_tree, &QTreeWidget::itemChanged, this, &MainWindow::onTreeItemChanged);
   connect(m_tree, &QTreeWidget::itemDoubleClicked, this,
           &MainWindow::onTreeItemActivated);
   connect(m_tree, &QWidget::customContextMenuRequested, this, [this](const QPoint& p) {
     if (auto* item = m_tree->itemAt(p)) {
+      // Read the index up front: activating a stage rebuilds the tree and
+      // invalidates the QTreeWidgetItem pointer.
+      const int idx = item->data(0, Qt::UserRole).toInt();
+      // A right-click may transiently change Qt's tree selection. Restore
+      // the explicit Combine set so the highlighted stages and the stages
+      // Combine will use always agree.
+      if (!m_stageSelection.isEmpty())
+        setStageSelection(m_stageSelection);
       QMenu menu;
+      // Modifier-clicks are not reliable on every platform/window manager,
+      // so allow building a Combine selection one stage at a time here.
+      auto* selectAction =
+          menu.addAction(QStringLiteral("Select this stage for Combine"));
+      selectAction->setCheckable(true);
+      // Check the explicit persistent set: a right-click may transiently
+      // select the item under the cursor, which must not look like an
+      // already-added Combine stage.
+      selectAction->setChecked(m_stageSelection.contains(idx));
+      connect(selectAction, &QAction::toggled, this, [this, idx](bool on) {
+        setStageSelection(toggleStageSelection(selectedStageIndices(), idx, on));
+      });
+      menu.addAction(QStringLiteral("Clear Combine selection"), this,
+                     &MainWindow::clearStageSelection);
+      menu.addSeparator();
       menu.addAction(QStringLiteral("Show only this stage"), this,
-                     [this, item] {
-                       m_doc.setActive(item->data(0, Qt::UserRole).toInt());
+                     [this, idx] {
+                       m_doc.setActive(idx);
                        for (int i = 0; i < m_doc.nodeCount(); ++i)
                          m_visible.remove(i);
                        m_visible.insert(m_doc.activeIndex());
                        refreshAll();
                      });
+      menu.addAction(QStringLiteral("Transform (translate/rotate)..."), this,
+                     [this, idx] {
+                       m_doc.setActive(idx);
+                       runTransform();
+                     });
       menu.addAction(QStringLiteral("Revert to this stage (drop later ops)"),
                      this, &MainWindow::revertToSelectedStage);
+      menu.addAction(QStringLiteral("Combine selected stages..."), this,
+                     &MainWindow::runCombineSelected);
       menu.exec(m_tree->viewport()->mapToGlobal(p));
     }
   });
@@ -187,6 +246,49 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
           });
   rightLayout->addWidget(probeBox);
 
+  // --- Selection: viewport triangle picking for subset filters ---
+  auto* selBox = new QWidget(right);
+  auto* selLayout = new QVBoxLayout(selBox);
+  selLayout->addWidget(new QLabel(
+      QStringLiteral("<b>Selection</b> (S in viewport: click or drag)"),
+      selBox));
+  m_selectBtn = new QPushButton(QStringLiteral("Select (S)"), selBox);
+  m_selectBtn->setCheckable(true);
+  m_selectBtn->setToolTip(QStringLiteral(
+      "Pick triangles on the active stage: click toggles one, drag selects "
+      "a rectangle. Filters below run on the selected subset."));
+  selLayout->addWidget(m_selectBtn);
+  m_selectLabel = new QLabel(QStringLiteral("No selection."), selBox);
+  m_selectLabel->setWordWrap(true);
+  selLayout->addWidget(m_selectLabel);
+  auto* selBtns = new QHBoxLayout();
+  auto* remeshSel = new QPushButton(QStringLiteral("Remesh selection..."), selBox);
+  auto* detectSel = new QPushButton(QStringLiteral("Detect leaks"), selBox);
+  selBtns->addWidget(remeshSel);
+  selBtns->addWidget(detectSel);
+  selLayout->addLayout(selBtns);
+  auto* selBtns2 = new QHBoxLayout();
+  auto* extractSel = new QPushButton(QStringLiteral("Extract as stage"), selBox);
+  auto* clearSelBtn = new QPushButton(QStringLiteral("Clear"), selBox);
+  selBtns2->addWidget(extractSel);
+  selBtns2->addWidget(clearSelBtn);
+  selLayout->addLayout(selBtns2);
+  rightLayout->addWidget(selBox);
+  connect(m_selectBtn, &QPushButton::toggled, this,
+          &MainWindow::toggleSelectMode);
+  connect(m_view, &VtkView::facesSelected, this, &MainWindow::onFacesSelected);
+  connect(remeshSel, &QPushButton::clicked, this,
+          &MainWindow::runRemeshSelection);
+  connect(detectSel, &QPushButton::clicked, this,
+          &MainWindow::runDetectLeaksSelection);
+  connect(extractSel, &QPushButton::clicked, this,
+          &MainWindow::runExtractSelection);
+  connect(clearSelBtn, &QPushButton::clicked, this, &MainWindow::clearSelection);
+  auto* selectShortcut = new QShortcut(QKeySequence(QStringLiteral("s")), m_view);
+  selectShortcut->setContext(Qt::WidgetShortcut);
+  connect(selectShortcut, &QShortcut::activated, this,
+          [this] { m_selectBtn->toggle(); });
+
   auto* wrapBox = new QWidget(right);
   auto* wrapLayout = new QVBoxLayout(wrapBox);
   wrapLayout->addWidget(new QLabel(
@@ -278,6 +380,40 @@ bool MainWindow::requireMesh() const {
   return true;
 }
 
+QSet<int> MainWindow::selectedStageIndices() const {
+  QSet<int> treeSelection;
+  for (const auto* item : m_tree->selectedItems())
+    treeSelection.insert(item->data(0, Qt::UserRole).toInt());
+  // Once the user has picked stages explicitly (right-click or the
+  // Combine checkboxes), that set is authoritative. Otherwise fall back
+  // to normal tree multi-selection.
+  return resolveStageSelection(m_stageSelection, treeSelection);
+}
+
+void MainWindow::setStageSelection(const QSet<int>& stages) {
+  if (!m_tree)
+    return;
+  m_stageSelection = stages;
+  // Programmatic checkbox/selection updates must not recurse through
+  // onTreeItemChanged.
+  const QSignalBlocker blocker(m_tree);
+  for (int i = 0; i < m_tree->topLevelItemCount(); ++i) {
+    auto* item = m_tree->topLevelItem(i);
+    const bool selected =
+        m_stageSelection.contains(item->data(0, Qt::UserRole).toInt());
+    item->setCheckState(2, selected ? Qt::Checked : Qt::Unchecked);
+    item->setSelected(selected);
+  }
+}
+
+void MainWindow::clearStageSelection() {
+  setStageSelection({});
+}
+
+void MainWindow::pruneStageSelection() {
+  m_stageSelection = validStageSelection(m_stageSelection, m_doc.nodeCount());
+}
+
 void MainWindow::openMesh() {
   const QString path = QFileDialog::getOpenFileName(
       this, QStringLiteral("Open mesh"), {},
@@ -291,6 +427,8 @@ void MainWindow::openMesh() {
     return;
   }
   const MeshStats s = computeStats(mesh);
+  m_stageSelection.clear();
+  m_tree->clearSelection();
   m_doc.setSource(std::move(mesh), QFileInfo(path).fileName());
   m_visible.clear();
   m_visible.insert(0);
@@ -302,6 +440,102 @@ void MainWindow::openMesh() {
           .arg(s.boundaryEdges));
   if (!s.closed)
     log(QStringLiteral("Note: mesh is not watertight; use Detect leaks / Patch holes."));
+}
+
+void MainWindow::importMeshes() {
+  const QStringList paths = QFileDialog::getOpenFileNames(
+      this, QStringLiteral("Import meshes"), {},
+      QStringLiteral("Meshes (*.stl *.off *.obj);;All files (*)"));
+  for (const QString& path : paths) {
+    Mesh mesh;
+    QString error;
+    if (!loadMesh(path, mesh, error)) {
+      QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
+      continue;
+    }
+    const MeshStats s = computeStats(mesh);
+    m_doc.appendSource(QFileInfo(path).fileName(), std::move(mesh));
+    m_visible.insert(m_doc.activeIndex());
+    log(QStringLiteral("Imported %1: %2 verts, %3 faces, %4 boundary edges.")
+            .arg(path)
+            .arg(s.vertices)
+            .arg(s.faces)
+            .arg(s.boundaryEdges));
+    if (!s.closed)
+      log(QStringLiteral("Note: mesh is not watertight; use Detect leaks / Patch holes."));
+  }
+}
+
+void MainWindow::runCombineSelected() {
+  QSet<int> picked = selectedStageIndices();
+  QList<int> idx;
+  for (int i : picked) {
+    if (i >= 0 && i < m_doc.nodeCount())
+      idx.append(i);
+  }
+  std::sort(idx.begin(), idx.end());
+  if (idx.size() < 2) {
+    QMessageBox::information(
+        this, QStringLiteral("MeshBench"),
+        QStringLiteral("Select two or more tree stages first "
+                       "(Ctrl/Cmd-click or Shift-click)."));
+    return;
+  }
+  QDialog dlg(this);
+  dlg.setWindowTitle(QStringLiteral("Combine selected stages"));
+  auto* layout = new QVBoxLayout(&dlg);
+  auto* combo = new QComboBox(&dlg);
+  combo->addItems({QStringLiteral("Append (concatenate, always works)"),
+                   QStringLiteral("Union (sequential boolean union)")});
+  layout->addWidget(combo);
+  layout->addWidget(new QLabel(
+      QStringLiteral("%1 stages selected. Union needs closed meshes and "
+                     "stops at the first pair that fails.")
+          .arg(idx.size()),
+      &dlg));
+  auto* buttons =
+      new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+  layout->addWidget(buttons);
+  connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+  connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+  if (dlg.exec() != QDialog::Accepted)
+    return;
+  Mesh out;
+  QString details;
+  QString error;
+  if (combo->currentIndex() == 0) {
+    std::vector<const Mesh*> inputs;
+    for (int i : idx)
+      inputs.push_back(&m_doc.node(i).mesh);
+    out = mergeMeshes(inputs);
+    details = QStringLiteral("%1 stages appended").arg(idx.size());
+  } else {
+    out = m_doc.node(idx.front()).mesh;
+    for (int k = 1; k < idx.size(); ++k) {
+      Mesh next;
+      if (!booleanOp(out, m_doc.node(idx[k]).mesh, BooleanOp::Union, next,
+                     error)) {
+        QMessageBox::warning(
+            this, QStringLiteral("MeshBench"),
+            QStringLiteral("Union failed at stage %1: %2").arg(idx[k]).arg(error));
+        return;
+      }
+      out = std::move(next);
+    }
+    details = QStringLiteral("union of %1 stages").arg(idx.size());
+  }
+  const MeshStats s = computeStats(out);
+  if (s.faces == 0) {
+    QMessageBox::warning(this, QStringLiteral("MeshBench"),
+                         QStringLiteral("Combine produced an empty mesh."));
+    return;
+  }
+  m_doc.appendOperation(QStringLiteral("Combine"), details, std::move(out));
+  m_visible.insert(m_doc.activeIndex());
+  log(QStringLiteral("Combined %1 stages (%2): %3 faces.")
+          .arg(idx.size())
+          .arg(details)
+          .arg(s.faces));
 }
 
 void MainWindow::saveActiveMesh() {
@@ -322,9 +556,16 @@ void MainWindow::saveActiveMesh() {
 void MainWindow::clearAll() {
   m_doc.clear();
   m_visible.clear();
+  m_stageSelection.clear();
   m_view->clear();
+  if (m_selectBtn && m_selectBtn->isChecked())
+    m_selectBtn->setChecked(false);
+  m_selectMode = false;
+  m_selectionStage = -1;
+  m_selection.clear();
   rebuildTree();
   updateStagePanel();
+  updateSelectPanel();
 }
 
 static bool paramDialog(QWidget* parent, const QString& title,
@@ -439,6 +680,56 @@ void MainWindow::runCenter() {
   log(QStringLiteral("Centered geometry at center of volume."));
 }
 
+void MainWindow::runTransform() {
+  if (!requireMesh())
+    return;
+  QMap<QString, double> d;
+  QMap<QString, int> i;
+  QMap<QString, bool> bv;
+  if (!paramDialog(this, QStringLiteral("Transform (translate + rotate)"),
+                   {{QStringLiteral("Translate X"), 0.0},
+                    {QStringLiteral("Translate Y"), 0.0},
+                    {QStringLiteral("Translate Z"), 0.0},
+                    {QStringLiteral("Rotate X (deg)"), 0.0},
+                    {QStringLiteral("Rotate Y (deg)"), 0.0},
+                    {QStringLiteral("Rotate Z (deg)"), 0.0}},
+                   {}, d, i,
+                   {{QStringLiteral("Rotate about mesh center"), true}}, &bv))
+    return;
+  TransformParams params;
+  params.translate[0] = d[QStringLiteral("Translate X")];
+  params.translate[1] = d[QStringLiteral("Translate Y")];
+  params.translate[2] = d[QStringLiteral("Translate Z")];
+  params.rotateDeg[0] = d[QStringLiteral("Rotate X (deg)")];
+  params.rotateDeg[1] = d[QStringLiteral("Rotate Y (deg)")];
+  params.rotateDeg[2] = d[QStringLiteral("Rotate Z (deg)")];
+  params.rotateAboutCenter = bv.value(QStringLiteral("Rotate about mesh center"), true);
+  const std::size_t inFaces = m_doc.activeMesh().num_faces();
+  Mesh out = m_doc.activeMesh();
+  QString error;
+  if (!transformMesh(out, params, error)) {
+    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
+    return;
+  }
+  // Exit check: the filter must return the same topology it consumed.
+  if (out.num_vertices() == 0 || out.num_faces() != inFaces) {
+    QMessageBox::warning(this, QStringLiteral("MeshBench"),
+                         QStringLiteral("Transform produced an invalid mesh."));
+    return;
+  }
+  const auto fmt = [](double v) { return QString::number(v, 'g', 6); };
+  const QString pivot = params.rotateAboutCenter ? QStringLiteral("center")
+                                                 : QStringLiteral("origin");
+  const QString details =
+      QStringLiteral("t=(%1,%2,%3) r=(%4,%5,%6) deg about %7")
+          .arg(fmt(params.translate[0]), fmt(params.translate[1]),
+               fmt(params.translate[2]), fmt(params.rotateDeg[0]),
+               fmt(params.rotateDeg[1]), fmt(params.rotateDeg[2]), pivot);
+  m_doc.appendOperation(QStringLiteral("Transform"), details, std::move(out));
+  m_visible.insert(m_doc.activeIndex());
+  log(QStringLiteral("Transformed stage: %1.").arg(details));
+}
+
 void MainWindow::runAlphaWrap() {
   if (!requireMesh())
     return;
@@ -521,6 +812,10 @@ void MainWindow::runClip() {
 void MainWindow::runDetectLeaks() {
   if (!requireMesh())
     return;
+  probeMeshAndAppend(m_doc.activeMesh(), QStringLiteral("LeakProbe"));
+}
+
+void MainWindow::probeMeshAndAppend(const Mesh& mesh, const QString& stageLabel) {
   const auto probes = probesFromTable();
   m_doc.setProbes(probes);
   std::vector<std::array<double, 3>> inPts, outPts;
@@ -537,8 +832,8 @@ void MainWindow::runDetectLeaks() {
     return;
   ProbeParams probeParams;
   probeParams.gridRes = iv["Voxels per axis"];
-  const auto res = detectLeaks(m_doc.activeMesh(), inPts, outPts, probeParams);
-  const auto loops = findHoleLoops(m_doc.activeMesh());
+  const auto res = detectLeaks(mesh, inPts, outPts, probeParams);
+  const auto loops = findHoleLoops(mesh);
   LeakReport report;
   report.probed = true;
   report.hasLeak = res.hasLeak;
@@ -565,9 +860,9 @@ void MainWindow::runDetectLeaks() {
   // The input eye goes off (as in ParaView): the probe duplicates the input
   // geometry, and drawing both would z-fight instead of showing a solid.
   const int leakSource = m_doc.activeIndex();
-  Mesh probed = m_doc.activeMesh();
+  Mesh probed = mesh;
   m_doc.appendOperation(
-      QStringLiteral("LeakProbe"),
+      stageLabel,
       QStringLiteral("%1 loops, %2 leak(s)").arg(loops.size()).arg(res.paths.size()),
       std::move(probed));
   m_doc.setLeakReport(report);
@@ -704,19 +999,9 @@ void MainWindow::runGmshRemesh() {
   if (!paramDialog(this, QStringLiteral("Gmsh remesh"),
                    {{"Target element size", 0.1}}, {}, d, iv))
     return;
-  const QString tmpIn = QDir::temp().filePath(QStringLiteral("meshbench_in.stl"));
-  const QString tmpOut = QDir::temp().filePath(QStringLiteral("meshbench_out.stl"));
   QString error;
-  if (!saveMesh(tmpIn, m_doc.activeMesh(), error)) {
-    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
-    return;
-  }
-  if (!remeshStlWithGmsh(tmpIn, tmpOut, d["Target element size"], error)) {
-    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
-    return;
-  }
   Mesh out;
-  if (!loadMesh(tmpOut, out, error)) {
+  if (!remeshMesh(m_doc.activeMesh(), d["Target element size"], out, error)) {
     QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
     return;
   }
@@ -728,6 +1013,22 @@ void MainWindow::runGmshRemesh() {
 #else
   QMessageBox::information(this, QStringLiteral("MeshBench"),
                            QStringLiteral("Gmsh support not compiled in."));
+#endif
+}
+
+bool MainWindow::remeshMesh(const Mesh& in, double size, Mesh& out,
+                            QString& error) {
+#ifdef MESHBENCH_HAVE_GMSH
+  const QString tmpIn = QDir::temp().filePath(QStringLiteral("meshbench_in.stl"));
+  const QString tmpOut = QDir::temp().filePath(QStringLiteral("meshbench_out.stl"));
+  if (!saveMesh(tmpIn, in, error))
+    return false;
+  if (!remeshStlWithGmsh(tmpIn, tmpOut, size, error))
+    return false;
+  return loadMesh(tmpOut, out, error);
+#else
+  error = QStringLiteral("Gmsh support not compiled in.");
+  return false;
 #endif
 }
 
@@ -751,10 +1052,11 @@ void MainWindow::runCreatePrimitive() {
   form->addRow(dimBox);
   QList<QDoubleSpinBox*> dimEdits;
   auto rebuildDims = [&] {
-    while (dimForm->count() > 0) {
-      auto* item = dimForm->takeAt(0);
+    // takeAt() transfers ownership of the item to the caller; the guard
+    // frees it even on early exit, and the widget is owned by dimBox.
+    while (QLayoutItem* raw = dimForm->takeAt(0)) {
+      std::unique_ptr<QLayoutItem> item(raw);
       delete item->widget();
-      delete item;
     }
     dimEdits.clear();
     const auto shape = shapes[shapeCombo->currentIndex()];
@@ -808,11 +1110,11 @@ void MainWindow::runCreatePrimitive() {
   for (double v : params.dims)
     dimStr.append(QString::number(v));
   const MeshStats s = computeStats(mesh);
-  m_doc.setSource(std::move(mesh),
-                  QStringLiteral("%1(%2)").arg(primitiveShapeName(params.shape),
-                                              dimStr.join(QStringLiteral(","))));
-  m_visible.clear();
-  m_visible.insert(0);
+  m_doc.appendSource(QStringLiteral("%1(%2)")
+                         .arg(primitiveShapeName(params.shape),
+                              dimStr.join(QStringLiteral(","))),
+                     std::move(mesh));
+  m_visible.insert(m_doc.activeIndex());
   probesToTable({});
   setDefaultProbes();
   log(QStringLiteral("Created %1 primitive: %2 faces, closed=%3.")
@@ -953,9 +1255,172 @@ void MainWindow::togglePickMode(bool on) {
   updateShrinkPanel();
 }
 
+void MainWindow::toggleSelectMode(bool on) {
+  m_selectMode = on;
+  if (!on) {
+    m_view->setSelectMode(false);
+    updateSelectPanel();
+    return;
+  }
+  if (!requireMesh()) {
+    m_selectBtn->setChecked(false);
+    m_selectMode = false;
+    return;
+  }
+  // Shrinkwrap picking and rectangle selection both swallow the mouse.
+  if (m_pickBtn->isChecked())
+    m_pickBtn->setChecked(false);
+  if (m_selectionStage != m_doc.activeIndex()) {
+    // Faces belong to one stage; switching stages restarts the set.
+    m_selectionStage = m_doc.activeIndex();
+    m_selection.clear();
+  }
+  m_visible.insert(m_selectionStage);
+  refreshView();
+  m_view->setSelectMode(true, m_selectionStage);
+  m_view->setSelection(m_selectionStage, m_selection);
+  log(QStringLiteral("Select mode on stage %1: click toggles a triangle, "
+                     "drag selects a rectangle (S toggles).")
+          .arg(m_selectionStage));
+  updateSelectPanel();
+}
+
+void MainWindow::onFacesSelected(const QSet<int>& faces) {
+  if (!m_selectMode)
+    return;
+  for (int f : faces)
+    m_selection.insert(f);
+  m_view->setSelection(m_selectionStage, m_selection);
+  log(QStringLiteral("Rectangle added %1 triangles (%2 selected).")
+          .arg(faces.size())
+          .arg(m_selection.size()));
+  updateSelectPanel();
+}
+
+void MainWindow::runExtractSelection() {
+  if (m_selection.isEmpty() || m_selectionStage < 0 ||
+      m_selectionStage >= m_doc.nodeCount()) {
+    QMessageBox::information(this, QStringLiteral("MeshBench"),
+                             QStringLiteral("Select triangles first (S in "
+                                            "the viewport, then click/drag)."));
+    return;
+  }
+  Mesh sub = extractSubmesh(m_doc.node(m_selectionStage).mesh, m_selection);
+  const std::size_t faces = sub.num_faces();
+  if (faces == 0) {
+    QMessageBox::information(this, QStringLiteral("MeshBench"),
+                             QStringLiteral("Selection holds no faces."));
+    return;
+  }
+  m_doc.appendOperation(
+      QStringLiteral("Selection"),
+      QStringLiteral("%1 faces from stage %2").arg(faces).arg(m_selectionStage),
+      std::move(sub));
+  m_visible.insert(m_doc.activeIndex());
+  log(QStringLiteral("Extracted %1 selected faces as a new stage.").arg(faces));
+}
+
+void MainWindow::runRemeshSelection() {
+#ifdef MESHBENCH_HAVE_GMSH
+  if (m_selection.isEmpty() || m_selectionStage < 0 ||
+      m_selectionStage >= m_doc.nodeCount()) {
+    QMessageBox::information(this, QStringLiteral("MeshBench"),
+                             QStringLiteral("Select triangles first (S in "
+                                            "the viewport, then click/drag)."));
+    return;
+  }
+  QMap<QString, double> d;
+  QMap<QString, int> iv;
+  if (!paramDialog(this, QStringLiteral("Gmsh remesh (selection)"),
+                   {{"Target element size", 0.1}}, {}, d, iv))
+    return;
+  Mesh sub = extractSubmesh(m_doc.node(m_selectionStage).mesh, m_selection);
+  QString error;
+  Mesh out;
+  if (!remeshMesh(sub, d["Target element size"], out, error)) {
+    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
+    return;
+  }
+  m_doc.appendOperation(
+      QStringLiteral("GmshRemesh (selection)"),
+      QStringLiteral("size=%1, %2 faces in").arg(d["Target element size"]).arg(sub.num_faces()),
+      std::move(out));
+  m_visible.insert(m_doc.activeIndex());
+  log(QStringLiteral("Gmsh remesh of selection done: %1 faces.")
+          .arg(computeStats(out).faces));
+#else
+  QMessageBox::information(this, QStringLiteral("MeshBench"),
+                           QStringLiteral("Gmsh support not compiled in."));
+#endif
+}
+
+void MainWindow::runDetectLeaksSelection() {
+  if (m_selection.isEmpty() || m_selectionStage < 0 ||
+      m_selectionStage >= m_doc.nodeCount()) {
+    QMessageBox::information(this, QStringLiteral("MeshBench"),
+                             QStringLiteral("Select triangles first (S in "
+                                            "the viewport, then click/drag)."));
+    return;
+  }
+  const Mesh sub =
+      extractSubmesh(m_doc.node(m_selectionStage).mesh, m_selection);
+  if (sub.num_faces() == 0) {
+    QMessageBox::information(this, QStringLiteral("MeshBench"),
+                             QStringLiteral("Selection holds no faces."));
+    return;
+  }
+  probeMeshAndAppend(sub, QStringLiteral("LeakProbe (selection)"));
+}
+
+void MainWindow::clearSelection() {
+  m_selection.clear();
+  m_view->setSelection(m_selectionStage, m_selection);
+  updateSelectPanel();
+}
+
+void MainWindow::updateSelectPanel() {
+  if (!m_selectLabel)
+    return;
+  QStringList parts;
+  if (m_selectionStage >= 0)
+    parts << QStringLiteral("Stage %1.").arg(m_selectionStage);
+  parts << (m_selection.isEmpty()
+                ? QStringLiteral("No triangles selected.")
+                : QStringLiteral("%1 triangles selected.")
+                      .arg(m_selection.size()));
+  parts << QStringLiteral("Select mode %1.").arg(
+      m_selectBtn && m_selectBtn->isChecked() ? QStringLiteral("ON")
+                                             : QStringLiteral("off"));
+  m_selectLabel->setText(parts.join(QStringLiteral(" ")));
+}
+
+void MainWindow::validateSelection() {
+  if (m_selectionStage >= m_doc.nodeCount()) {
+    // Selected stage was reverted away: drop the session.
+    if (m_selectBtn && m_selectBtn->isChecked())
+      m_selectBtn->setChecked(false);
+    else
+      m_view->setSelectMode(false);
+    m_selectMode = false;
+    m_selectionStage = -1;
+    m_selection.clear();
+  }
+  updateSelectPanel();
+}
+
 void MainWindow::onFacePicked(int faceIdx) {
   if (faceIdx < 0)
     return;
+  if (m_selectMode) {
+    // Rectangle-selection session: clicks toggle single triangles.
+    if (m_selection.contains(faceIdx))
+      m_selection.remove(faceIdx);
+    else
+      m_selection.insert(faceIdx);
+    m_view->setSelection(m_selectionStage, m_selection);
+    updateSelectPanel();
+    return;
+  }
   // Click toggles membership so stray clicks are easy to undo.
   if (m_faceSelection.contains(faceIdx))
     m_faceSelection.remove(faceIdx);
@@ -1109,9 +1574,18 @@ void MainWindow::probesToTable(const QVector<ProbePoint>& probes) {
 }
 
 void MainWindow::onTreeItemChanged(QTreeWidgetItem* item, int column) {
-  if (m_updatingTree || !item || column != 0)
+  if (m_updatingTree || !item)
     return;
   const int idx = item->data(0, Qt::UserRole).toInt();
+  if (column == 2) {
+    // Dedicated Combine checkbox: independent of visibility (column 0)
+    // and of Qt's transient tree selection.
+    setStageSelection(toggleStageSelection(
+        m_stageSelection, idx, item->checkState(2) == Qt::Checked));
+    return;
+  }
+  if (column != 0)
+    return;
   if (item->checkState(0) == Qt::Checked)
     m_visible.insert(idx);
   else
@@ -1136,7 +1610,9 @@ void MainWindow::revertToSelectedStage() {
 }
 
 void MainWindow::refreshAll() {
+  pruneStageSelection();
   validateShrinkState();
+  validateSelection();
   rebuildTree();
   updateStagePanel();
   refreshView();
@@ -1144,6 +1620,11 @@ void MainWindow::refreshAll() {
 
 void MainWindow::rebuildTree() {
   m_updatingTree = true;
+  // Rebuilding drops Qt selection: remember the selected stages first.
+  QSet<int> kept;
+  for (const auto* sel : m_tree->selectedItems())
+    kept.insert(sel->data(0, Qt::UserRole).toInt());
+  kept = mergeStageSelections(kept, m_stageSelection);
   m_tree->clear();
   for (int i = 0; i < m_doc.nodeCount(); ++i) {
     const auto& node = m_doc.node(i);
@@ -1153,13 +1634,18 @@ void MainWindow::rebuildTree() {
       label += QStringLiteral(" (%1)").arg(node.details);
     item->setText(0, label);
     item->setData(0, Qt::UserRole, i);
+    item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
     item->setCheckState(0, m_visible.contains(i) ? Qt::Checked : Qt::Unchecked);
+    item->setCheckState(2, m_stageSelection.contains(i) ? Qt::Checked
+                                                       : Qt::Unchecked);
+    item->setToolTip(2, QStringLiteral("Include this stage in Combine"));
     const MeshStats s = computeStats(node.mesh);
     item->setText(1, QStringLiteral("%1 f / %2 bnd")
                          .arg(s.faces)
                          .arg(s.boundaryEdges));
-    if (i == m_doc.activeIndex()) {
+    if (kept.contains(i))
       item->setSelected(true);
+    if (i == m_doc.activeIndex()) {
       QFont f = item->font(0);
       f.setBold(true);
       item->setFont(0, f);

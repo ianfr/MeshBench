@@ -5,12 +5,15 @@
 
 #include "MeshDocument.h"
 #include "MeshOps.h"
+#include "ViewOrientations.h"
 #include "test_utils.h"
 
 #include <QDir>
 #include <QTemporaryDir>
 #include <QtTest>
+#include <array>
 #include <cmath>
+#include <limits>
 
 using namespace meshbench;
 
@@ -173,6 +176,214 @@ private slots:
     QVERIFY(std::abs(std::abs(s.volume) - 1.0) < 1e-6); // 2*1*0.5
   }
 #endif
+
+  void extractSubmeshKeepsOnlySelectedFaces() {
+    const Mesh cube = testutil::makeClosedCube(); // 12 triangles
+    // Faces 0+1 are the bottom (z=0) quad split in two; they share an edge.
+    const Mesh sub = extractSubmesh(cube, QSet<int>{0, 1});
+    const MeshStats s = computeStats(sub);
+    QVERIFY(s.valid);
+    QCOMPARE(s.faces, static_cast<std::size_t>(2));
+    QCOMPARE(sub.num_vertices(), static_cast<std::size_t>(4));
+    QVERIFY(s.bboxMin[2] >= -1e-9 && s.bboxMax[2] <= 1e-9); // still at z=0
+    QVERIFY(std::abs(std::abs(s.volume)) < 1e-9); // open sheet, no volume
+  }
+
+  void extractSubmeshIgnoresBadIds() {
+    const Mesh cube = testutil::makeClosedCube();
+    QCOMPARE(computeStats(extractSubmesh(cube, {})).faces,
+             static_cast<std::size_t>(0));
+    QCOMPARE(computeStats(extractSubmesh(cube, QSet<int>{-1, 999})).faces,
+             static_cast<std::size_t>(0));
+    // Full selection round-trips every face.
+    QSet<int> all;
+    for (int i = 0; i < 12; ++i)
+      all.insert(i);
+    QCOMPARE(computeStats(extractSubmesh(cube, all)).faces,
+             computeStats(cube).faces);
+  }
+
+  void translateMeshShiftsBBox() {
+    Mesh m = testutil::makeClosedCube(); // [0,1]^3
+    translateMesh(m, 2.0, -1.0, 0.5);
+    const MeshStats s = computeStats(m);
+    QVERIFY(s.valid);
+    QVERIFY(std::abs(s.bboxMin[0] - 2.0) < 1e-9);
+    QVERIFY(std::abs(s.bboxMax[0] - 3.0) < 1e-9);
+    QVERIFY(std::abs(s.bboxMin[1] + 1.0) < 1e-9);
+    QVERIFY(std::abs(s.bboxMin[2] - 0.5) < 1e-9);
+    QCOMPARE(s.faces, static_cast<std::size_t>(12));
+    // Unit volume preserved: pure translation.
+    QVERIFY(std::abs(std::abs(s.volume) - 1.0) < 1e-9);
+  }
+
+  void transformTranslatesMesh() {
+    Mesh m = testutil::makeClosedCube(); // [0,1]^3
+    TransformParams p;
+    p.translate[0] = 3.0;
+    p.translate[1] = -2.0;
+    p.translate[2] = 1.5;
+    QString error;
+    QVERIFY2(transformMesh(m, p, error), qPrintable(error));
+    const MeshStats s = computeStats(m);
+    QVERIFY(s.valid);
+    QVERIFY(std::abs(s.bboxMin[0] - 3.0) < 1e-9);
+    QVERIFY(std::abs(s.bboxMax[0] - 4.0) < 1e-9);
+    QVERIFY(std::abs(s.bboxMin[1] + 2.0) < 1e-9);
+    QVERIFY(std::abs(s.bboxMin[2] - 1.5) < 1e-9);
+    QCOMPARE(s.faces, static_cast<std::size_t>(12));
+    QVERIFY(std::abs(std::abs(s.volume) - 1.0) < 1e-9);
+  }
+
+  // 45 degrees about the bbox center keeps the center fixed but expands the
+  // axis-aligned box to 0.5 +/- sqrt(2)/2; volume must stay unchanged.
+  void transformRotatesAboutMeshCenter() {
+    Mesh m = testutil::makeClosedCube(); // [0,1]^3
+    TransformParams p;
+    p.rotateDeg[2] = 45.0;
+    p.rotateAboutCenter = true;
+    QString error;
+    QVERIFY2(transformMesh(m, p, error), qPrintable(error));
+    const MeshStats s = computeStats(m);
+    QVERIFY(s.valid);
+    const double ext = std::sqrt(2.0) / 2.0;
+    QVERIFY(std::abs(s.bboxMin[0] - (0.5 - ext)) < 1e-9);
+    QVERIFY(std::abs(s.bboxMax[0] - (0.5 + ext)) < 1e-9);
+    QVERIFY(std::abs(s.bboxMin[1] - (0.5 - ext)) < 1e-9);
+    QVERIFY(std::abs(s.bboxMax[1] - (0.5 + ext)) < 1e-9);
+    QVERIFY(std::abs(s.bboxMin[2] - 0.0) < 1e-9);
+    QVERIFY(std::abs(s.bboxMax[2] - 1.0) < 1e-9);
+    QVERIFY(std::abs(std::abs(s.volume) - 1.0) < 1e-9);
+  }
+
+  // Rotation is applied first, in the world frame, then translation. A +90
+  // degree Z rotation about the origin maps [0,1]^2 to [-1,0]x[0,1].
+  void transformRotatesAboutOriginThenTranslates() {
+    Mesh m = testutil::makeClosedCube(); // [0,1]^3
+    TransformParams p;
+    p.rotateDeg[2] = 90.0;
+    p.rotateAboutCenter = false;
+    p.translate[0] = 2.0;
+    QString error;
+    QVERIFY2(transformMesh(m, p, error), qPrintable(error));
+    const MeshStats s = computeStats(m);
+    QVERIFY(s.valid);
+    QVERIFY(std::abs(s.bboxMin[0] - 1.0) < 1e-9);
+    QVERIFY(std::abs(s.bboxMax[0] - 2.0) < 1e-9);
+    QVERIFY(std::abs(s.bboxMin[1] - 0.0) < 1e-9);
+    QVERIFY(std::abs(s.bboxMax[1] - 1.0) < 1e-9);
+    QVERIFY(std::abs(s.bboxMin[2] - 0.0) < 1e-9);
+    QVERIFY(std::abs(s.bboxMax[2] - 1.0) < 1e-9);
+    QVERIFY(std::abs(std::abs(s.volume) - 1.0) < 1e-9);
+  }
+
+  void transformRejectsInvalidParameters() {
+    Mesh m = testutil::makeClosedCube();
+    TransformParams p;
+    p.translate[0] = std::numeric_limits<double>::infinity();
+    QString error;
+    QVERIFY(!transformMesh(m, p, error));
+    QVERIFY(!error.isEmpty());
+    QCOMPARE(computeStats(m).faces, static_cast<std::size_t>(12)); // untouched
+
+    Mesh empty;
+    TransformParams ok;
+    error.clear();
+    QVERIFY(!transformMesh(empty, ok, error));
+    QVERIFY(!error.isEmpty());
+  }
+
+  void standardViewBasesAreUnitAndOrthogonal() {
+    const std::array<StandardView, 6> views = {
+        StandardView::PosX, StandardView::NegX, StandardView::PosY,
+        StandardView::NegY, StandardView::PosZ, StandardView::NegZ};
+    for (StandardView v : views) {
+      const ViewBasis b = standardViewBasis(v);
+      const double len = std::sqrt(b.cameraOffset[0] * b.cameraOffset[0] +
+                                   b.cameraOffset[1] * b.cameraOffset[1] +
+                                   b.cameraOffset[2] * b.cameraOffset[2]);
+      const double dot = b.cameraOffset[0] * b.up[0] +
+                         b.cameraOffset[1] * b.up[1] +
+                         b.cameraOffset[2] * b.up[2];
+      QVERIFY(std::abs(len - 1.0) < 1e-12);
+      QVERIFY(std::abs(dot) < 1e-12);
+    }
+    // Menu order is +X, -X, +Y, -Y, +Z, -Z; +Z/-Z use Y as up.
+    QCOMPARE(standardViewBasis(StandardView::PosX).cameraOffset[0], 1.0);
+    QCOMPARE(standardViewBasis(StandardView::NegX).cameraOffset[0], -1.0);
+    QCOMPARE(standardViewBasis(StandardView::PosY).cameraOffset[1], 1.0);
+    QCOMPARE(standardViewBasis(StandardView::NegY).cameraOffset[1], -1.0);
+    QCOMPARE(standardViewBasis(StandardView::PosZ).cameraOffset[2], 1.0);
+    QCOMPARE(standardViewBasis(StandardView::NegZ).cameraOffset[2], -1.0);
+    QCOMPARE(standardViewBasis(StandardView::PosZ).up[1], 1.0);
+    QCOMPARE(standardViewBasis(StandardView::NegZ).up[1], 1.0);
+  }
+
+  void mergeMeshesConcatenates() {
+    const Mesh a = testutil::makeClosedCube(); // 12 faces, 8 verts
+    Mesh b = testutil::makeClosedCube();
+    // Shift the copy so the inputs merely touch at x=1.
+    for (auto v : b.vertices()) {
+      Point3 p = b.point(v);
+      b.point(v) = makePoint(toDouble(p.x()) + 1.0, toDouble(p.y()),
+                             toDouble(p.z()));
+    }
+    const Mesh m = mergeMeshes({&a, &b});
+    const MeshStats s = computeStats(m);
+    QVERIFY(s.valid);
+    // Faces add up; touching-vertex inputs stay split (no stitching).
+    QCOMPARE(s.faces, static_cast<std::size_t>(24));
+    QCOMPARE(m.num_vertices(), static_cast<std::size_t>(16));
+    QVERIFY(std::abs((s.bboxMax[0] - s.bboxMin[0]) - 2.0) < 1e-9);
+  }
+
+  void mergeMeshesSkipsNullAndEmpty() {
+    const Mesh a = testutil::makeClosedCube();
+    QCOMPARE(computeStats(mergeMeshes({})).faces, static_cast<std::size_t>(0));
+    QCOMPARE(computeStats(mergeMeshes({nullptr, &a})).faces,
+             computeStats(a).faces);
+  }
+
+  // The Combine dialog's Union path folds N stages with sequential pairwise
+  // unions; three overlapping cubes must come out as one watertight solid.
+  void booleanUnionChainsThreeObjects() {
+    const Mesh a = testutil::makeClosedCube(); // [0,1]^3
+    const Mesh b = translatedCube(0.5, 0.0, 0.0); // [0.5,1.5]
+    const Mesh c = translatedCube(1.0, 0.0, 0.0); // [1,2]
+    QString error;
+    Mesh ab, abc;
+    QVERIFY2(booleanOp(a, b, BooleanOp::Union, ab, error), qPrintable(error));
+    QVERIFY2(booleanOp(ab, c, BooleanOp::Union, abc, error), qPrintable(error));
+    const MeshStats s = computeStats(abc);
+    QVERIFY(s.valid);
+    QVERIFY2(s.closed && s.boundaryEdges == 0,
+             "chained union must stay watertight");
+    QVERIFY(std::abs(std::abs(s.volume) - 2.0) < 1e-6); // [0,2]x[0,1]x[0,1]
+    QVERIFY(std::abs((s.bboxMax[0] - s.bboxMin[0]) - 2.0) < 1e-9);
+  }
+
+  // Selection round-trip: split a mesh into complementary subsets (as the
+  // viewport selection does) and recombine them with merge; every face
+  // must survive and the bounding box must round-trip.
+  void extractSubsetsRecombineToWhole() {
+    const Mesh cube = testutil::makeClosedCube(); // 12 faces
+    QSet<int> lo, hi;
+    for (int i = 0; i < 12; ++i)
+      (i < 6 ? lo : hi).insert(i);
+    const Mesh a = extractSubmesh(cube, lo);
+    const Mesh b = extractSubmesh(cube, hi);
+    QCOMPARE(computeStats(a).faces, static_cast<std::size_t>(6));
+    QCOMPARE(computeStats(b).faces, static_cast<std::size_t>(6));
+    const Mesh m = mergeMeshes({&a, &b});
+    const MeshStats s = computeStats(m);
+    QVERIFY(s.valid);
+    QCOMPARE(s.faces, computeStats(cube).faces);
+    const MeshStats c = computeStats(cube);
+    for (int k = 0; k < 3; ++k) {
+      QVERIFY(std::abs(s.bboxMin[k] - c.bboxMin[k]) < 1e-9);
+      QVERIFY(std::abs(s.bboxMax[k] - c.bboxMax[k]) < 1e-9);
+    }
+  }
 
   void removeRandomTrianglesIsExactAndSeeded() {
     QString error;

@@ -26,6 +26,7 @@ function(add_meshbench_test name)
   # LeakFix.cpp / MeshOps.cpp are compiled into each test binary.
   target_sources(${name} PRIVATE
     ${CMAKE_SOURCE_DIR}/src/LeakFix.cpp
+    ${CMAKE_SOURCE_DIR}/src/MeshDocument.cpp
     ${CMAKE_SOURCE_DIR}/src/MeshOps.cpp
     ${CMAKE_SOURCE_DIR}/src/Shrinkwrap.cpp
   )
@@ -35,5 +36,6 @@ function(add_meshbench_test name)
 endfunction()
 
 add_meshbench_test(tst_leakfix)
+add_meshbench_test(tst_meshdocument)
 add_meshbench_test(tst_meshops)
 add_meshbench_test(tst_shrinkwrap)

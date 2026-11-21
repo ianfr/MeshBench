@@ -38,6 +38,25 @@ int MeshDocument::appendOperation(const QString& label, const QString& details, 
   return m_active;
 }
 
+int MeshDocument::appendSource(const QString& label, Mesh&& mesh) {
+  if (m_nodes.isEmpty()) {
+    setSource(std::move(mesh), label);
+    return m_active;
+  }
+  // Imports extend the tip: jumping the active pointer there first keeps
+  // every existing node instead of dropping a redo tail.
+  m_active = m_nodes.size() - 1;
+  PipelineNode node;
+  node.label = label.isEmpty() ? QStringLiteral("Source") : label;
+  node.timestamp = QDateTime::currentDateTime();
+  node.mesh = std::move(mesh);
+  m_nodes.append(std::move(node));
+  m_active = m_nodes.size() - 1;
+  emit historyChanged();
+  emit activeChanged(m_active);
+  return m_active;
+}
+
 void MeshDocument::setActive(int i) {
   if (i < 0 || i >= m_nodes.size() || i == m_active)
     return;

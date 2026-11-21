@@ -134,6 +134,84 @@ bool centerAtVolumeCentroid(Mesh& mesh, QString& error) {
   }
 }
 
+void translateMesh(Mesh& mesh, double dx, double dy, double dz) {
+  const Vector3 t(dx, dy, dz);
+  const CGAL::Aff_transformation_3<Kernel> tr(CGAL::TRANSLATION, t);
+  for (auto v : mesh.vertices())
+    mesh.point(v) = tr(mesh.point(v));
+}
+
+bool transformMesh(Mesh& mesh, const TransformParams& params, QString& error) {
+  if (mesh.num_vertices() == 0) {
+    error = QStringLiteral("Mesh is empty.");
+    return false;
+  }
+  for (int k = 0; k < 3; ++k) {
+    if (!std::isfinite(params.translate[k]) ||
+        !std::isfinite(params.rotateDeg[k])) {
+      error = QStringLiteral("Transform values must be finite.");
+      return false;
+    }
+  }
+  try {
+    const std::size_t vertexCount = mesh.num_vertices();
+    const std::size_t faceCount = mesh.num_faces();
+    constexpr double pi = 3.14159265358979323846;
+    const double rx = params.rotateDeg[0] * pi / 180.0;
+    const double ry = params.rotateDeg[1] * pi / 180.0;
+    const double rz = params.rotateDeg[2] * pi / 180.0;
+    const double cx = std::cos(rx), sx = std::sin(rx);
+    const double cy = std::cos(ry), sy = std::sin(ry);
+    const double cz = std::cos(rz), sz = std::sin(rz);
+    // Right-handed Euler rotation R = Rz * Ry * Rx (X applied first).
+    const double r11 = cz * cy;
+    const double r12 = cz * sy * sx - sz * cx;
+    const double r13 = cz * sy * cx + sz * sx;
+    const double r21 = sz * cy;
+    const double r22 = sz * sy * sx + cz * cx;
+    const double r23 = sz * sy * cx - cz * sx;
+    const double r31 = -sy;
+    const double r32 = cy * sx;
+    const double r33 = cy * cx;
+
+    double ox = 0.0, oy = 0.0, oz = 0.0;
+    if (params.rotateAboutCenter) {
+      const auto bb = PMP::bbox(mesh);
+      ox = (bb.xmin() + bb.xmax()) / 2;
+      oy = (bb.ymin() + bb.ymax()) / 2;
+      oz = (bb.zmin() + bb.zmax()) / 2;
+    }
+    // Fold the pivot into the homogeneous translation so a single affine
+    // map rotates about the pivot and then translates.
+    const double tx = params.translate[0] + ox - (r11 * ox + r12 * oy + r13 * oz);
+    const double ty = params.translate[1] + oy - (r21 * ox + r22 * oy + r23 * oz);
+    const double tz = params.translate[2] + oz - (r31 * ox + r32 * oy + r33 * oz);
+    const CGAL::Aff_transformation_3<Kernel> tr(
+        r11, r12, r13, tx,
+        r21, r22, r23, ty,
+        r31, r32, r33, tz);
+    for (auto v : mesh.vertices())
+      mesh.point(v) = tr(mesh.point(v));
+    // Exit check: a rigid transform must preserve topology and stay finite.
+    if (mesh.num_vertices() != vertexCount || mesh.num_faces() != faceCount) {
+      error = QStringLiteral("Transform changed the mesh topology.");
+      return false;
+    }
+    for (auto v : mesh.vertices()) {
+      const Point3& p = mesh.point(v);
+      if (!std::isfinite(toDouble(p.x())) || !std::isfinite(toDouble(p.y())) ||
+          !std::isfinite(toDouble(p.z()))) {
+        error = QStringLiteral("Transform produced non-finite coordinates.");
+        return false;
+      }
+    }
+    return true;
+  } catch (const std::exception& e) {
+    error = QString::fromUtf8(e.what());
+    return false;
+  }
+}
+
 static bool triangulatedCopy(const Mesh& in, Mesh& out, QString& error) {
   try {
     out = in;
@@ -508,6 +586,63 @@ int removeRandomTriangles(Mesh& mesh, int n, unsigned seed, QString& error) {
   }
   mesh = std::move(kept);
   return take;
+}
+
+Mesh extractSubmesh(const Mesh& mesh, const QSet<int>& faceIds) {
+  Mesh sub;
+  std::unordered_map<std::size_t, Mesh::Vertex_index> vmap;
+  for (auto f : mesh.faces()) {
+    if (!faceIds.contains(static_cast<int>(f.idx())))
+      continue;
+    // Copy the full vertex ring so polygonal faces survive intact.
+    std::vector<Mesh::Vertex_index> ring;
+    auto h = mesh.halfedge(f);
+    const auto start = h;
+    do {
+      const auto src = mesh.source(h);
+      auto it = vmap.find(src.idx());
+      if (it == vmap.end()) {
+        const auto fresh = sub.add_vertex(mesh.point(src));
+        vmap[src.idx()] = fresh;
+        ring.push_back(fresh);
+      } else {
+        ring.push_back(it->second);
+      }
+      h = mesh.next(h);
+    } while (h != start);
+    sub.add_face(ring);
+  }
+  return sub;
+}
+
+Mesh mergeMeshes(const std::vector<const Mesh*>& inputs) {
+  Mesh merged;
+  for (const Mesh* in : inputs) {
+    if (!in)
+      continue;
+    // Per-input vertex map: coincident vertices across inputs stay split,
+    // so Combine never stitches meshes that merely touch.
+    std::unordered_map<std::size_t, Mesh::Vertex_index> vmap;
+    for (auto f : in->faces()) {
+      std::vector<Mesh::Vertex_index> ring;
+      auto h = in->halfedge(f);
+      const auto start = h;
+      do {
+        const auto src = in->source(h);
+        auto it = vmap.find(src.idx());
+        if (it == vmap.end()) {
+          const auto fresh = merged.add_vertex(in->point(src));
+          vmap[src.idx()] = fresh;
+          ring.push_back(fresh);
+        } else {
+          ring.push_back(it->second);
+        }
+        h = in->next(h);
+      } while (h != start);
+      merged.add_face(ring);
+    }
+  }
+  return merged;
 }
 
 } // namespace meshbench

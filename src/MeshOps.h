@@ -13,8 +13,12 @@
 
 #include "MeshTypes.h"
 
+#include <QSet>
 #include <QString>
 #include <QVector>
+
+#include <array>
+#include <vector>
 
 namespace meshbench {
 
@@ -40,6 +44,26 @@ MeshStats computeStats(const Mesh& mesh);
 
 // Translate the mesh so the volume centroid sits at the origin.
 bool centerAtVolumeCentroid(Mesh& mesh, QString& error);
+
+// Shift every vertex by (dx, dy, dz). Used to place a newly created
+// mesh beside existing pipeline content so parallel objects do not
+// start out overlapping (and occluding) each other.
+void translateMesh(Mesh& mesh, double dx, double dy, double dz);
+
+// ParaView-style Transform filter parameters. Rotation is given as
+// right-handed Euler angles in degrees, applied X then Y then Z; the
+// translation is applied afterwards. When rotateAboutCenter is true the
+// mesh's bounding-box center is used as the rotation pivot, otherwise
+// the world origin is used.
+struct TransformParams {
+  std::array<double, 3> translate{0.0, 0.0, 0.0};
+  std::array<double, 3> rotateDeg{0.0, 0.0, 0.0};
+  bool rotateAboutCenter = true;
+};
+
+// Apply a rigid translate + rotate transform in place. Returns false (with
+// an error) for an empty mesh or non-finite parameters.
+bool transformMesh(Mesh& mesh, const TransformParams& params, QString& error);
 
 // Corefined boolean of two closed, triangulated meshes.
 bool booleanOp(const Mesh& a, const Mesh& b, BooleanOp op, Mesh& out, QString& error);
@@ -84,5 +108,15 @@ bool createPrimitiveStl(const PrimitiveParams& params, const QString& outPath,
 // intentionally puncture holes for leak-detection experiments.
 // Returns the number of faces actually removed.
 int removeRandomTriangles(Mesh& mesh, int n, unsigned seed, QString& error);
+
+// Build a mesh from a subset of faces (by face index); unreferenced
+// vertices are dropped. Out-of-range ids are ignored; an empty selection
+// yields an empty mesh. Used to run filters on a viewport selection.
+Mesh extractSubmesh(const Mesh& mesh, const QSet<int>& faceIds);
+
+// Concatenate meshes into one (faces appended, vertices remapped per
+// input; shared vertices are NOT merged). Null entries are skipped;
+// an empty input list yields an empty mesh. Used by Combine.
+Mesh mergeMeshes(const std::vector<const Mesh*>& inputs);
 
 } // namespace meshbench

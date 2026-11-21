@@ -30,10 +30,13 @@ public:
 
 private slots:
   void openMesh();
+  void importMeshes();
+  void runCombineSelected();
   void saveActiveMesh();
   void clearAll();
   void runBoolean();
   void runCenter();
+  void runTransform();
   void runAlphaWrap();
   void runClip();
   void runDetectLeaks();
@@ -51,6 +54,12 @@ private slots:
   void setDefaultProbes();
   void addProbeRow(bool inside);
   void removeSelectedProbes();
+  void toggleSelectMode(bool on);
+  void onFacesSelected(const QSet<int>& faces);
+  void runRemeshSelection();
+  void runDetectLeaksSelection();
+  void runExtractSelection();
+  void clearSelection();
 
   void onTreeItemChanged(QTreeWidgetItem* item, int column);
   void onTreeItemActivated(QTreeWidgetItem* item, int column);
@@ -66,11 +75,30 @@ private:
   void probesToTable(const QVector<ProbePoint>& probes);
   bool requireMesh() const;
 
+  // Explicit right-click stage selection for Combine (see StageSelection.h).
+  QSet<int> selectedStageIndices() const;
+  void setStageSelection(const QSet<int>& stages);
+  void clearStageSelection();
+  void pruneStageSelection();
+
   MeshDocument m_doc;
   VtkView* m_view = nullptr;
   QTreeWidget* m_tree = nullptr;
   QSet<int> m_visible; // pipeline indices currently drawn
+  QSet<int> m_stageSelection; // persistent Combine selection across right-clicks
   bool m_updatingTree = false;
+
+  // Viewport selection (S shortcut): face indices of m_selectionStage,
+  // shared id space with extractSubmesh; filters run on the submesh.
+  bool m_selectMode = false;
+  int m_selectionStage = -1;
+  QSet<int> m_selection;
+  QPushButton* m_selectBtn = nullptr;
+  QLabel* m_selectLabel = nullptr;
+  void updateSelectPanel();
+  void validateSelection();
+  void probeMeshAndAppend(const Mesh& mesh, const QString& stageLabel);
+  bool remeshMesh(const Mesh& in, double size, Mesh& out, QString& error);
 
   QLabel* m_stageInfo = nullptr;
   QDoubleSpinBox* m_opacitySpin = nullptr;

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(MeshBench VERSION 0.1.0 LANGUAGES CXX)
+project(MeshBench VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -10,16 +10,21 @@ option(MESHBENCH_ENABLE_GMSH "Enable Gmsh-based operations (requires Gmsh C++ AP
 option(MESHBENCH_BUILD_TESTS "Build unit tests" ON)
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets OpenGLWidgets)
+# Ubuntu's VTK config imports VTK::mpi whose link interface references
+# MPI::MPI_C, so locate MPI first (no-op where VTK was built without MPI).
+find_package(MPI QUIET)
 find_package(VTK REQUIRED COMPONENTS
   CommonCore
   CommonDataModel
   FiltersSources
   FiltersCore
+  FiltersExtraction
   IOGeometry
   RenderingCore
   RenderingOpenGL2
   RenderingAnnotation
   InteractionStyle
+  InteractionWidgets
   GUISupportQt
   RenderingQt
 )
