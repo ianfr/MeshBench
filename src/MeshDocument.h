@@ -9,11 +9,14 @@
 // a new operation while an older stage is active truncates the redo tail
 // first. Each node also carries the inside/outside probe points and the
 // leak report produced at that stage so results stay attached to history.
+// Removing a node also removes its downstream operation chain.
 
 #include "MeshTypes.h"
 
 #include <QDateTime>
+#include <QMap>
 #include <QObject>
+#include <QSet>
 #include <QString>
 #include <QStringList>
 #include <QVector>
@@ -57,8 +60,10 @@ struct PipelineNode {
   Mesh mesh;
   QVector<ProbePoint> probes;
   LeakReport leaks;
+  FeatureEdges featureEdges; // populated by the FeatureEdges filter
   double opacity = -1.0; // pinned stage opacity, <0 = auto (opaque when
                          // active, faint otherwise)
+  int parent = -1;       // producing stage; -1 for an independent source
 };
 
 class MeshDocument : public QObject {
@@ -75,21 +80,29 @@ public:
   const Mesh& activeMesh() const { return m_nodes.at(m_active).mesh; }
 
   // Replace everything with a freshly loaded source mesh.
-  void setSource(Mesh&& mesh, const QString& label);
+  void setSource(Mesh&& mesh, const QString& label,
+                 FeatureEdges featureEdges = {});
 
   // Append an operation result (truncates any redo tail first).
   // Returns the index of the new active node.
-  int appendOperation(const QString& label, const QString& details, Mesh&& mesh);
+  int appendOperation(const QString& label, const QString& details, Mesh&& mesh,
+                      FeatureEdges featureEdges = {});
 
   // Append a freshly imported mesh at the tip without truncating history
   // and without carrying probes forward. Returns the new active index.
-  int appendSource(const QString& label, Mesh&& mesh);
+  int appendSource(const QString& label, Mesh&& mesh,
+                   FeatureEdges featureEdges = {});
 
   void setActive(int i);
   // Replace the mesh stored at node i in place (used to refresh a
   // shrinkwrap stage after weight edits without spamming history).
   // Returns false for an out-of-range index.
   bool replaceMesh(int i, Mesh&& mesh);
+  // Remove the given nodes plus every downstream node that depends on
+  // them (a source's whole operation chain, but not independent sources).
+  // The active stage moves to the nearest surviving stage. Returns the
+  // old-index -> new-index mapping for surviving nodes.
+  QMap<int, int> removeNodes(const QSet<int>& indices);
   // Drop every node after i (used by "Revert to this stage").
   void truncateAfter(int i);
   void clear();

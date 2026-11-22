@@ -5,17 +5,23 @@
 
 #include "MeshDocument.h"
 #include "MeshOps.h"
+#include "OperationSearch.h"
 #include "ViewOrientations.h"
 #include "test_utils.h"
 
+#include <CGAL/Polygon_mesh_processing/measure.h>
+
 #include <QDir>
+#include <QFile>
 #include <QTemporaryDir>
 #include <QtTest>
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <limits>
 
 using namespace meshbench;
+namespace PMP = CGAL::Polygon_mesh_processing;
 
 static Mesh translatedCube(double dx, double dy, double dz) {
   Mesh m = testutil::makeClosedCube();
@@ -24,6 +30,49 @@ static Mesh translatedCube(double dx, double dy, double dz) {
     m.point(v) = makePoint(toDouble(p.x()) + dx, toDouble(p.y()) + dy,
                            toDouble(p.z()) + dz);
   }
+  return m;
+}
+
+// Cube whose top face is a fan around a point near the front edge; the small
+// fan triangle {A,B,O} is replaced by a raised bump of three fine triangles.
+// Autoclean should remove the bump and re-fill the triangular hole.
+static Mesh makeBumpyCube() {
+  Mesh m;
+  Mesh::Vertex_index v[8];
+  v[0] = m.add_vertex(makePoint(0, 0, 0));
+  v[1] = m.add_vertex(makePoint(1, 0, 0));
+  v[2] = m.add_vertex(makePoint(1, 1, 0));
+  v[3] = m.add_vertex(makePoint(0, 1, 0));
+  v[4] = m.add_vertex(makePoint(0, 0, 1)); // A
+  v[5] = m.add_vertex(makePoint(1, 0, 1)); // B
+  v[6] = m.add_vertex(makePoint(1, 1, 1)); // C
+  v[7] = m.add_vertex(makePoint(0, 1, 1)); // D
+  const auto O = m.add_vertex(makePoint(0.5, 0.1, 1));
+  const auto apex = m.add_vertex(makePoint(0.4, 0.05, 1.1));
+
+  // Bottom and sides (top face is rebuilt as a fan below).
+  const int tris[10][3] = {
+      {0, 2, 1}, {0, 3, 2},           // bottom
+      {0, 1, 5}, {0, 5, 4},           // front
+      {2, 3, 7}, {2, 7, 6},           // back
+      {0, 4, 7}, {0, 7, 3},           // left
+      {1, 2, 6}, {1, 6, 5},           // right
+  };
+  for (const auto& t : tris)
+    m.add_face(v[t[0]], v[t[1]], v[t[2]]);
+
+  const auto A = v[4];
+  const auto B = v[5];
+  const auto C = v[6];
+  const auto D = v[7];
+  // Top fan around O. {A,B,O} is the small hole covered by the bump.
+  m.add_face(B, C, O);
+  m.add_face(C, D, O);
+  m.add_face(D, A, O);
+  // Raised fine bump on the {A,B,O} hole.
+  m.add_face(A, B, apex);
+  m.add_face(B, O, apex);
+  m.add_face(O, A, apex);
   return m;
 }
 
@@ -108,7 +157,198 @@ private slots:
     QVERIFY(std::abs(s.volume) > 0.5); // roughly the unit cube
   }
 
-#ifdef MESHBENCH_HAVE_GMSH
+  void isotropicRemeshRefinesAndPreservesCubeFeatures() {
+    const Mesh cube = testutil::makeClosedCube(); // [0,1]^3
+    Mesh out;
+    QString error;
+    QVERIFY2(isotropicRemesh(cube, 0.25, 2, 30.0, out, error),
+             qPrintable(error));
+    const MeshStats s = computeStats(out);
+    QVERIFY(s.valid);
+    QVERIFY2(s.closed, "remeshed closed mesh must stay watertight");
+    QVERIFY2(s.faces > 50, "target length 0.25 must refine the 12-face cube");
+    // Marked sharp edges (the cube's 12 edges) are split/smoothed only
+    // along their own line, so the cube's bounds stay put.
+    for (int k = 0; k < 3; ++k) {
+      QVERIFY(std::abs(s.bboxMin[k] - 0.0) < 1e-6);
+      QVERIFY(std::abs(s.bboxMax[k] - 1.0) < 1e-6);
+    }
+    QVERIFY(std::abs(std::abs(s.volume) - 1.0) < 0.02);
+  }
+
+  void isotropicRemeshRejectsInvalidParameters() {
+    const Mesh cube = testutil::makeClosedCube();
+    Mesh out;
+    QString error;
+    QVERIFY(!isotropicRemesh(cube, 0.0, 2, 30.0, out, error));
+    QVERIFY(!error.isEmpty());
+    QVERIFY(!isotropicRemesh(cube, 0.25, 0, 30.0, out, error));
+    QVERIFY(!isotropicRemesh(cube, 0.25, 2, 181.0, out, error));
+    Mesh empty;
+    QVERIFY(!isotropicRemesh(empty, 0.25, 2, 30.0, out, error));
+  }
+
+  void extractFeatureEdgesFindsCubeEdges() {
+    const Mesh cube = testutil::makeClosedCube(); // [0,1]^3
+    FeatureEdges edges;
+    QString error;
+    QVERIFY2(extractFeatureEdges(cube, 30.0, true, edges, error),
+             qPrintable(error));
+    // A closed cube has exactly its 12 sharp edges (face diagonals are
+    // coplanar and excluded).
+    QCOMPARE(edges.edges.size(), static_cast<std::size_t>(12));
+    QCOMPARE(edges.points.size(), static_cast<std::size_t>(8));
+    for (const auto& p : edges.points) {
+      for (double c : p)
+        QVERIFY(c >= -1e-9 && c <= 1.0 + 1e-9);
+    }
+  }
+
+  void extractFeatureEdgesBoundaryOption() {
+    const Mesh open = testutil::makeOpenCube(); // one 4-edge top hole
+    FeatureEdges withBoundary;
+    FeatureEdges withoutBoundary;
+    QString error;
+    // At 180 degrees no dihedral angle qualifies; only the open boundary
+    // can produce edges.
+    QVERIFY2(extractFeatureEdges(open, 180.0, true, withBoundary, error),
+             qPrintable(error));
+    QCOMPARE(withBoundary.edges.size(), static_cast<std::size_t>(4));
+    QVERIFY2(extractFeatureEdges(open, 180.0, false, withoutBoundary, error),
+             qPrintable(error));
+    QVERIFY(withoutBoundary.empty());
+  }
+
+  void featureEdgeMeshSavesAndLoads() {
+    const Mesh cube = testutil::makeClosedCube();
+    FeatureEdges original;
+    QString error;
+    QVERIFY2(extractFeatureEdges(cube, 30.0, true, original, error),
+             qPrintable(error));
+    QTemporaryDir tmp;
+    QVERIFY(tmp.isValid());
+    const QString path = tmp.filePath(QStringLiteral("cube.eMesh"));
+    QVERIFY2(writeFeatureEdgeMesh(path, original, error), qPrintable(error));
+
+    QFile file(path);
+    QVERIFY(file.open(QIODevice::ReadOnly | QIODevice::Text));
+    const QString text = QString::fromUtf8(file.readAll());
+    file.close();
+    QVERIFY(text.contains(QStringLiteral("class       featureEdgeMesh;")));
+    QVERIFY(text.contains(QStringLiteral("// points:")));
+    QVERIFY(text.contains(QStringLiteral("// edges:")));
+
+    FeatureEdges loaded;
+    QVERIFY2(loadFeatureEdges(path, loaded, error), qPrintable(error));
+    QCOMPARE(loaded.points.size(), original.points.size());
+    QCOMPARE(loaded.edges.size(), original.edges.size());
+    for (std::size_t i = 0; i < loaded.points.size(); ++i) {
+      for (int k = 0; k < 3; ++k)
+        QVERIFY(std::abs(loaded.points[i][k] - original.points[i][k]) < 1e-12);
+    }
+    for (std::size_t i = 0; i < loaded.edges.size(); ++i) {
+      QCOMPARE(loaded.edges[i][0], original.edges[i][0]);
+      QCOMPARE(loaded.edges[i][1], original.edges[i][1]);
+    }
+  }
+
+  void snapToFeatureEdgesRestoresCubeFeatures() {
+    const Mesh cube = testutil::makeClosedCube();
+    FeatureEdges edges;
+    QString error;
+    QVERIFY2(extractFeatureEdges(cube, 30.0, true, edges, error),
+             qPrintable(error));
+    Mesh out;
+    QVERIFY2(snapToFeatureEdges(cube, edges, 0.25, 20.0, out, error),
+             qPrintable(error));
+    const MeshStats s = computeStats(out);
+    QVERIFY(s.valid);
+    QVERIFY2(s.closed, "snapped mesh must stay watertight");
+    QVERIFY2(s.faces > 12, "feature snapping must refine the cube");
+    for (int k = 0; k < 3; ++k) {
+      QVERIFY(std::abs(s.bboxMin[k] - 0.0) < 1e-6);
+      QVERIFY(std::abs(s.bboxMax[k] - 1.0) < 1e-6);
+    }
+    QVERIFY(std::abs(std::abs(s.volume) - 1.0) < 0.02);
+    // The facet-angle criterion should keep every triangle well away from
+    // zero area (a sliver would have an area near machine epsilon).
+    double minArea = std::numeric_limits<double>::max();
+    for (auto f : out.faces())
+      minArea = std::min(minArea, toDouble(PMP::face_area(f, out)));
+    QVERIFY2(minArea > 1e-8, "snapping must not create sliver triangles");
+  }
+
+  void snapToFeatureEdgesWorksAfterAlphaWrap() {
+    const Mesh original = testutil::makeClosedCube();
+    const Mesh open = testutil::makeOpenCube();
+    FeatureEdges edges;
+    QString error;
+    QVERIFY2(extractFeatureEdges(original, 30.0, true, edges, error),
+             qPrintable(error));
+    Mesh wrapped;
+    QVERIFY2(alphaWrap(open, 0.6, 0.15, wrapped, error), qPrintable(error));
+    Mesh out;
+    QVERIFY2(snapToFeatureEdges(wrapped, edges, 0.25, 20.0, out, error),
+             qPrintable(error));
+    const MeshStats s = computeStats(out);
+    QVERIFY(s.valid);
+    QVERIFY2(s.closed, "feature-snapped alpha wrap must stay watertight");
+    QVERIFY2(s.faces > 12, "snapping must produce a usable surface mesh");
+    QVERIFY(std::abs(s.volume) > 0.5);
+    double minArea = std::numeric_limits<double>::max();
+    for (auto f : out.faces())
+      minArea = std::min(minArea, toDouble(PMP::face_area(f, out)));
+    QVERIFY2(minArea > 1e-8, "snapping must not create sliver triangles");
+  }
+
+  void snapToFeatureEdgesRejectsInvalidInput() {
+    const Mesh cube = testutil::makeClosedCube();
+    FeatureEdges edges;
+    QString error;
+    QVERIFY2(extractFeatureEdges(cube, 30.0, true, edges, error),
+             qPrintable(error));
+    Mesh out;
+    QVERIFY(!snapToFeatureEdges(cube, FeatureEdges{}, 0.25, 20.0, out, error));
+    QVERIFY(!snapToFeatureEdges(cube, edges, 0.0, 20.0, out, error));
+    QVERIFY(!snapToFeatureEdges(cube, edges, 0.25, 31.0, out, error));
+    Mesh empty;
+    QVERIFY(!snapToFeatureEdges(empty, edges, 0.25, 20.0, out, error));
+  }
+
+  void autoCleanRemovesSmallBumpAndPatches() {
+    Mesh m = makeBumpyCube();
+    AutoCleanParams params;
+    params.detailSizeRatio = 0.6;
+    params.maxRegionFraction = 0.9;
+    params.minSmallFaces = 3;
+    params.growRings = 0;
+    params.maxHoleEdges = 64;
+    AutoCleanResult result;
+    QString error;
+    QVERIFY2(autoCleanMesh(m, params, result, error), qPrintable(error));
+    QCOMPARE(result.clustersRemoved, 1);
+    QCOMPARE(result.facesRemoved, 3);
+    QCOMPARE(result.holesPatched, 1);
+    QVERIFY2(result.patchFacesAdded > 0,
+             "the removed bump must leave a filled hole");
+    const MeshStats s = computeStats(m);
+    QVERIFY(s.valid);
+    QVERIFY2(s.closed, "autoclean must close the hole left by the removed "
+                       "detail cluster");
+    QVERIFY(s.faces >= 12);
+  }
+
+  void autoCleanLeavesUniformMeshAlone() {
+    Mesh cube = testutil::makeClosedCube();
+    AutoCleanParams params; // default parameters
+    AutoCleanResult result;
+    QString error;
+    QVERIFY2(autoCleanMesh(cube, params, result, error), qPrintable(error));
+    QCOMPARE(result.clustersRemoved, 0);
+    QCOMPARE(result.facesRemoved, 0);
+    QCOMPARE(computeStats(cube).faces, static_cast<std::size_t>(12));
+  }
+
   // Remeshing must actually remesh: a 12-face unit cube at target size
   // 0.1 comes back with hundreds of faces, not the input mesh.
   void gmshRemeshRespectsTargetSize() {
@@ -175,7 +415,6 @@ private slots:
     QVERIFY2(s.closed, "meshed Gmsh box must be watertight");
     QVERIFY(std::abs(std::abs(s.volume) - 1.0) < 1e-6); // 2*1*0.5
   }
-#endif
 
   void extractSubmeshKeepsOnlySelectedFaces() {
     const Mesh cube = testutil::makeClosedCube(); // 12 triangles
@@ -201,6 +440,98 @@ private slots:
       all.insert(i);
     QCOMPARE(computeStats(extractSubmesh(cube, all)).faces,
              computeStats(cube).faces);
+  }
+
+  void removeMeshFacesCopiesAndDropsUnusedVertices() {
+    const Mesh cube = testutil::makeClosedCube();
+    Mesh out;
+    int removed = 0;
+    QString error;
+    QVERIFY2(removeMeshFaces(cube, QSet<int>{0, 1}, out, removed, error),
+             qPrintable(error));
+    QCOMPARE(removed, 2);
+    QCOMPARE(out.num_faces(), static_cast<std::size_t>(10));
+    // The input stage is untouched: deletions become a new tree object.
+    QCOMPARE(cube.num_faces(), static_cast<std::size_t>(12));
+
+    // Keep one triangle: every other face and all unused vertices go away.
+    QSet<int> most;
+    for (int i = 1; i < 12; ++i)
+      most.insert(i);
+    Mesh one;
+    int oneRemoved = 0;
+    QVERIFY2(removeMeshFaces(cube, most, one, oneRemoved, error),
+             qPrintable(error));
+    QCOMPARE(oneRemoved, 11);
+    QCOMPARE(one.num_faces(), static_cast<std::size_t>(1));
+    QCOMPARE(one.num_vertices(), static_cast<std::size_t>(3));
+
+    // Ids that do not name a face are ignored and report no deletion.
+    Mesh none;
+    int noneRemoved = 0;
+    QVERIFY(!removeMeshFaces(cube, QSet<int>{-1, 999}, none, noneRemoved,
+                             error));
+    QCOMPARE(noneRemoved, 0);
+    QVERIFY(!error.isEmpty());
+  }
+
+  void removeFeatureEdgesCompactsPoints() {
+    const Mesh cube = testutil::makeClosedCube();
+    FeatureEdges edges;
+    QString error;
+    QVERIFY2(extractFeatureEdges(cube, 30.0, true, edges, error),
+             qPrintable(error));
+    QCOMPARE(edges.edges.size(), static_cast<std::size_t>(12));
+
+    const QSet<int> drop{0, 1, 2, 3};
+    FeatureEdges out;
+    int removed = 0;
+    QVERIFY2(removeFeatureEdges(edges, drop, out, removed, error),
+             qPrintable(error));
+    QCOMPARE(removed, 4);
+    QCOMPARE(out.edges.size(), edges.edges.size() - 4);
+    // Surviving edges keep their geometry and all indices stay in range.
+    std::size_t k = 0;
+    for (std::size_t i = 0; i < edges.edges.size(); ++i) {
+      if (drop.contains(static_cast<int>(i)))
+        continue;
+      const auto& src = edges.edges[i];
+      const auto& got = out.edges[k++];
+      QVERIFY(got[0] >= 0 && got[0] < static_cast<int>(out.points.size()));
+      QVERIFY(got[1] >= 0 && got[1] < static_cast<int>(out.points.size()));
+      for (int axis = 0; axis < 3; ++axis) {
+        QVERIFY(std::abs(out.points[static_cast<std::size_t>(got[0])][axis] -
+                         edges.points[static_cast<std::size_t>(src[0])][axis]) <
+                1e-12);
+        QVERIFY(std::abs(out.points[static_cast<std::size_t>(got[1])][axis] -
+                         edges.points[static_cast<std::size_t>(src[1])][axis]) <
+                1e-12);
+      }
+    }
+
+    // Removing the only edge that used a point drops that point too.
+    FeatureEdges chain;
+    chain.points = {{{0.0, 0.0, 0.0}}, {{1.0, 0.0, 0.0}}, {{2.0, 0.0, 0.0}}};
+    chain.edges = {{{0, 1}}, {{1, 2}}};
+    FeatureEdges compacted;
+    int chainRemoved = 0;
+    QVERIFY2(removeFeatureEdges(chain, QSet<int>{0}, compacted, chainRemoved,
+                                error),
+             qPrintable(error));
+    QCOMPARE(chainRemoved, 1);
+    QCOMPARE(compacted.points.size(), static_cast<std::size_t>(2));
+    QCOMPARE(compacted.edges.size(), static_cast<std::size_t>(1));
+    QCOMPARE(compacted.edges[0][0], 0);
+    QCOMPARE(compacted.edges[0][1], 1);
+    QCOMPARE(compacted.points[0][0], 1.0);
+    QCOMPARE(compacted.points[1][0], 2.0);
+
+    FeatureEdges none;
+    int noneRemoved = 0;
+    QVERIFY(!removeFeatureEdges(edges, QSet<int>{-1, 999}, none, noneRemoved,
+                                error));
+    QCOMPARE(noneRemoved, 0);
+    QVERIFY(none.empty());
   }
 
   void translateMeshShiftsBBox() {
@@ -291,6 +622,18 @@ private slots:
     error.clear();
     QVERIFY(!transformMesh(empty, ok, error));
     QVERIFY(!error.isEmpty());
+  }
+
+  void operationSearchMatchesAllTerms() {
+    QVERIFY(operationSearchMatches(QStringLiteral("Isotropic remesh..."),
+                                   QStringLiteral("iso")));
+    QVERIFY(operationSearchMatches(QStringLiteral("Snap to feature edges..."),
+                                   QStringLiteral("snap edges")));
+    QVERIFY(operationSearchMatches(QStringLiteral("Alpha wrap..."), QString()));
+    QVERIFY(!operationSearchMatches(QStringLiteral("Alpha wrap..."),
+                                    QStringLiteral("snap")));
+    QVERIFY(!operationSearchMatches(QStringLiteral("Alpha wrap..."),
+                                    QStringLiteral("alpha missing")));
   }
 
   void standardViewBasesAreUnitAndOrthogonal() {

@@ -10,6 +10,9 @@
 #include <CGAL/Exact_predicates_exact_constructions_kernel.h>
 #include <CGAL/Surface_mesh.h>
 
+#include <array>
+#include <vector>
+
 namespace meshbench {
 
 using Kernel = CGAL::Exact_predicates_exact_constructions_kernel;
@@ -23,5 +26,15 @@ inline double toDouble(const Kernel::FT& v) { return CGAL::to_double(v); }
 inline Point3 makePoint(double x, double y, double z) {
   return Point3(Kernel::FT(x), Kernel::FT(y), Kernel::FT(z));
 }
+
+// Sharp/boundary edge extraction result. Points are stored in double
+// precision and edges are index pairs into that point array, matching the
+// OpenFOAM edgeMesh layout used for eMesh export.
+struct FeatureEdges {
+  std::vector<std::array<double, 3>> points;
+  std::vector<std::array<int, 2>> edges;
+
+  bool empty() const { return edges.empty(); }
+};
 
 } // namespace meshbench

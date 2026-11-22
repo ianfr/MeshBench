@@ -6,10 +6,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
 
-option(MESHBENCH_ENABLE_GMSH "Enable Gmsh-based operations (requires Gmsh C++ API)" ON)
 option(MESHBENCH_BUILD_TESTS "Build unit tests" ON)
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets OpenGLWidgets)
+find_package(Boost 1.70 REQUIRED)
 # Ubuntu's VTK config imports VTK::mpi whose link interface references
 # MPI::MPI_C, so locate MPI first (no-op where VTK was built without MPI).
 find_package(MPI QUIET)
@@ -20,6 +20,7 @@ find_package(VTK REQUIRED COMPONENTS
   FiltersCore
   FiltersExtraction
   IOGeometry
+  IOImage
   RenderingCore
   RenderingOpenGL2
   RenderingAnnotation
@@ -34,29 +35,29 @@ if(OpenMP_CXX_FOUND)
   message(STATUS "MeshBench: OpenMP enabled (${OpenMP_CXX_VERSION})")
 endif()
 
+# Gmsh is required: the GUI's primitive/remesh operations and the MCP-only
+# low-level CAD session tools use its C++ API directly.
+#
 # NB: we link the libgmsh file directly rather than the gmsh::shared imported
 # target, whose INTERFACE_LINK_LIBRARIES names .so dev symlinks (OpenCASCADE
 # TK*, metis, GLU) that are not installed here. The versioned runtime libs
 # those names resolve to are present, so direct linking works.
-if(MESHBENCH_ENABLE_GMSH)
-  find_package(gmsh CONFIG QUIET)
-  find_library(MESHBENCH_GMSH_LIB NAMES gmsh)
-  find_path(MESHBENCH_GMSH_INCLUDE NAMES gmsh.h)
-endif()
-if(MESHBENCH_GMSH_LIB AND MESHBENCH_GMSH_INCLUDE)
-  message(STATUS "MeshBench: Gmsh support enabled (${MESHBENCH_GMSH_LIB})")
-else()
-  message(STATUS "MeshBench: Gmsh library/headers not found, support disabled")
-  unset(MESHBENCH_GMSH_LIB CACHE)
-  set(MESHBENCH_GMSH_LIB "")
-endif()
+find_library(MESHBENCH_GMSH_LIB NAMES gmsh REQUIRED)
+find_path(MESHBENCH_GMSH_INCLUDE NAMES gmsh.h REQUIRED)
+message(STATUS "MeshBench: Gmsh required and found (${MESHBENCH_GMSH_LIB})")
 
 set(MESHBENCH_SOURCES
   src/main.cpp
+  src/Commands.cpp
+  src/GmshCadSession.cpp
   src/MainWindow.cpp
+  src/MainWindowCommands.cpp
+  src/McpHttpServer.cpp
+  src/McpProtocol.cpp
   src/MeshDocument.cpp
   src/MeshOps.cpp
   src/LeakFix.cpp
+  src/SceneExport.cpp
   src/Shrinkwrap.cpp
   src/VtkView.cpp
 )
@@ -66,14 +67,12 @@ target_include_directories(meshbench PRIVATE src)
 target_link_libraries(meshbench PRIVATE
   Qt6::Widgets
   Qt6::OpenGLWidgets
+  Boost::headers
   ${VTK_LIBRARIES}
   CGAL::CGAL
+  ${MESHBENCH_GMSH_LIB}
 )
-if(MESHBENCH_GMSH_LIB)
-  target_link_libraries(meshbench PRIVATE ${MESHBENCH_GMSH_LIB})
-  target_include_directories(meshbench PRIVATE ${MESHBENCH_GMSH_INCLUDE})
-  target_compile_definitions(meshbench PRIVATE MESHBENCH_HAVE_GMSH=1)
-endif()
+target_include_directories(meshbench PRIVATE ${MESHBENCH_GMSH_INCLUDE})
 if(OpenMP_CXX_FOUND)
   target_link_libraries(meshbench PRIVATE OpenMP::OpenMP_CXX)
 endif()

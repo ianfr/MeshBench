@@ -1,5 +1,6 @@
 #include "VtkView.h"
 #include "LeakFix.h"
+#include "SceneExport.h"
 
 #include <array>
 #include <QMouseEvent>
@@ -8,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <unordered_map>
 
 #include <vtkAbstractArray.h>
@@ -15,6 +17,7 @@
 #include <vtkAxesActor.h>
 #include <vtkCamera.h>
 #include <vtkCaptionActor2D.h>
+#include <vtkCell.h>
 #include <vtkCellArray.h>
 #include <vtkCellPicker.h>
 #include <vtkDataObject.h>
@@ -191,6 +194,34 @@ vtkSmartPointer<vtkActor> VtkView::meshActor(const Mesh& mesh, double r,
   actor->GetProperty()->SetOpacity(opacity);
   actor->GetProperty()->EdgeVisibilityOn();
   actor->GetProperty()->SetEdgeColor(0.1, 0.1, 0.12);
+  return actor;
+}
+
+vtkSmartPointer<vtkActor> VtkView::featureEdgeActor(const FeatureEdges& edges) {
+  auto points = vtkSmartPointer<vtkPoints>::New();
+  points->SetDataTypeToDouble();
+  for (const auto& p : edges.points)
+    points->InsertNextPoint(p[0], p[1], p[2]);
+  auto lines = vtkSmartPointer<vtkCellArray>::New();
+  for (const auto& e : edges.edges) {
+    auto line = vtkSmartPointer<vtkLine>::New();
+    line->GetPointIds()->SetId(0, e[0]);
+    line->GetPointIds()->SetId(1, e[1]);
+    lines->InsertNextCell(line);
+  }
+  auto poly = vtkSmartPointer<vtkPolyData>::New();
+  poly->SetPoints(points);
+  poly->SetLines(lines);
+  auto mapper = vtkSmartPointer<vtkPolyDataMapper>::New();
+  mapper->SetInputData(poly);
+  mapper->SetResolveCoincidentTopologyToPolygonOffset();
+  mapper->SetRelativeCoincidentTopologyLineOffsetParameters(-1.0, -2.0);
+  auto actor = vtkSmartPointer<vtkActor>::New();
+  actor->SetMapper(mapper);
+  actor->PickableOn();
+  actor->GetProperty()->SetColor(1.0, 0.72, 0.1);
+  actor->GetProperty()->SetLineWidth(4.0);
+  actor->GetProperty()->SetLighting(false);
   return actor;
 }
 
@@ -388,8 +419,11 @@ void VtkView::showDocument(const MeshDocument& doc,
   m_stageActors.clear();
   m_stageCellFaces.clear();
   m_stagePoly.clear();
+  m_featureEdgeActors.clear();
+  m_stageFeaturePoly.clear();
   m_overlayActors.clear();
   m_selectActor = nullptr;
+  m_edgeSelectActor = nullptr;
   if (!doc.hasMesh()) {
     renderWindow()->Render();
     return;
@@ -405,14 +439,18 @@ void VtkView::showDocument(const MeshDocument& doc,
       continue;
     const bool active = (i == activeStage);
     const bool isWrap = doc.node(i).label.startsWith(QStringLiteral("Shrinkwrap"));
+    const bool hasFeatureEdges = !doc.node(i).featureEdges.empty();
     const double* c = isWrap ? nullptr : palette[color++ % 6];
     std::vector<std::size_t> cellFaces;
     // The wrap is always translucent cyan so the baseline shows through.
     // Other stages default to opaque when active, faint otherwise; an
-    // opacity pinned in the inspector overrides the default.
+    // opacity pinned in the inspector overrides the default. Feature-edge
+    // stages are also transparent by default so their lines stand out.
     const double pinned = doc.node(i).opacity;
-    const double op =
+    double op =
         isWrap ? 0.3 : (pinned >= 0.0 ? pinned : (active ? 1.0 : 0.35));
+    if (hasFeatureEdges && pinned < 0.0)
+      op = 0.22;
     auto actor = isWrap ? meshActor(doc.node(i).mesh, 0.35, 0.9, 0.95, op, cellFaces)
                         : meshActor(doc.node(i).mesh, c[0], c[1], c[2],
                                     op, cellFaces);
@@ -423,6 +461,17 @@ void VtkView::showDocument(const MeshDocument& doc,
     // its cells after a rebuild (cell order matches m_stageCellFaces).
     if (auto* pdMapper = vtkPolyDataMapper::SafeDownCast(actor->GetMapper()))
       m_stagePoly[i] = pdMapper->GetInput();
+    if (hasFeatureEdges) {
+      auto edgesActor = featureEdgeActor(doc.node(i).featureEdges);
+      m_renderer->AddActor(edgesActor);
+      m_overlayActors.push_back(edgesActor);
+      m_featureEdgeActors[i] = edgesActor;
+      // Keep the line geometry so selected edges can be re-extracted after a
+      // rebuild; one line cell maps 1:1 to a FeatureEdges::edges index.
+      if (auto* pdMapper =
+              vtkPolyDataMapper::SafeDownCast(edgesActor->GetMapper()))
+        m_stageFeaturePoly[i] = pdMapper->GetInput();
+    }
   }
   // Editing highlights (hole loops, probes, leak paths) belong to the
   // active stage only, and vanish entirely when its eye is off — an
@@ -507,8 +556,14 @@ void VtkView::clear() {
   m_stageActors.clear();
   m_stageCellFaces.clear();
   m_stagePoly.clear();
+  m_featureEdgeActors.clear();
+  m_stageFeaturePoly.clear();
   m_overlayActors.clear();
   m_selectActor = nullptr;
+  m_edgeSelectActor = nullptr;
+  m_selFaces.clear();
+  m_selEdges.clear();
+  m_selStage = -1;
   renderWindow()->Render();
 }
 
@@ -516,6 +571,39 @@ void VtkView::resetCamera() {
   ensureAxesWidget();
   m_renderer->ResetCamera();
   renderWindow()->Render();
+}
+
+bool VtkView::sceneImagePng(int width, int height, QByteArray& png,
+                            QString& error) {
+  // Runtime safety checks at entry: a live render window is required.
+  png.clear();
+  error.clear();
+  if (!m_renderer || !renderWindow()) {
+    error = QStringLiteral("Scene image export: viewport is not ready.");
+    return false;
+  }
+  if (!renderWindowPng(renderWindow(), width, height, png, error))
+    return false;
+  // Exit check: a successful export is a non-empty PNG.
+  if (png.isEmpty()) {
+    error = QStringLiteral("Scene image export produced no data.");
+    return false;
+  }
+  return true;
+}
+
+bool VtkView::saveSceneImage(const QString& path, int width, int height,
+                             QString& error) {
+  error.clear();
+  if (path.isEmpty()) {
+    error = QStringLiteral("No output path given.");
+    return false;
+  }
+  if (!m_renderer || !renderWindow()) {
+    error = QStringLiteral("Scene image export: viewport is not ready.");
+    return false;
+  }
+  return writeRenderWindowPng(renderWindow(), path, width, height, error);
 }
 
 void VtkView::setStandardView(StandardView view) {
@@ -576,47 +664,102 @@ void VtkView::setSelection(int stage, const QSet<int>& faces) {
     renderWindow()->Render();
 }
 
+void VtkView::setEdgeSelection(int stage, const QSet<int>& edges) {
+  m_selStage = stage;
+  m_selEdges = edges;
+  updateSelectionHighlight();
+  if (renderWindow())
+    renderWindow()->Render();
+}
+
 void VtkView::updateSelectionHighlight() {
   if (m_selectActor) {
     m_renderer->RemoveActor(m_selectActor);
     m_selectActor = nullptr;
   }
-  if (m_selStage < 0 || m_selFaces.isEmpty())
-    return;
-  const auto polyIt = m_stagePoly.find(m_selStage);
-  const auto facesIt = m_stageCellFaces.find(m_selStage);
-  if (polyIt == m_stagePoly.end() || facesIt == m_stageCellFaces.end())
-    return;
-  const auto& cellFaces = facesIt.value();
-  auto ids = vtkSmartPointer<vtkIdTypeArray>::New();
-  for (vtkIdType c = 0; c < static_cast<vtkIdType>(cellFaces.size()); ++c) {
-    if (m_selFaces.contains(
-            static_cast<int>(cellFaces[static_cast<std::size_t>(c)])))
-      ids->InsertNextValue(c);
+  if (m_edgeSelectActor) {
+    m_renderer->RemoveActor(m_edgeSelectActor);
+    m_edgeSelectActor = nullptr;
   }
-  if (ids->GetNumberOfTuples() == 0)
+  if (m_selStage < 0)
     return;
-  auto node = vtkSmartPointer<vtkSelectionNode>::New();
-  node->SetFieldType(vtkSelectionNode::CELL);
-  node->SetContentType(vtkSelectionNode::INDICES);
-  node->SetSelectionList(ids);
-  auto sel = vtkSmartPointer<vtkSelection>::New();
-  sel->AddNode(node);
-  auto extract = vtkSmartPointer<vtkExtractSelection>::New();
-  extract->SetInputData(0, polyIt.value());
-  extract->SetInputData(1, sel);
-  extract->Update();
-  auto mapper = vtkSmartPointer<vtkDataSetMapper>::New();
-  mapper->SetInputConnection(extract->GetOutputPort());
-  mapper->ScalarVisibilityOff();
-  mapper->SetResolveCoincidentTopologyToPolygonOffset();
-  m_selectActor = vtkSmartPointer<vtkActor>::New();
-  m_selectActor->SetMapper(mapper);
-  m_selectActor->GetProperty()->SetColor(1.0, 1.0, 0.0);
-  m_selectActor->GetProperty()->EdgeVisibilityOn();
-  m_selectActor->GetProperty()->SetEdgeColor(0.6, 0.6, 0.0);
-  m_selectActor->PickableOff();
-  m_renderer->AddActor(m_selectActor);
+
+  // Selected triangles: extract their display cells and paint them yellow.
+  if (!m_selFaces.isEmpty()) {
+    const auto polyIt = m_stagePoly.find(m_selStage);
+    const auto facesIt = m_stageCellFaces.find(m_selStage);
+    if (polyIt != m_stagePoly.end() && facesIt != m_stageCellFaces.end()) {
+      const auto& cellFaces = facesIt.value();
+      auto ids = vtkSmartPointer<vtkIdTypeArray>::New();
+      for (vtkIdType c = 0; c < static_cast<vtkIdType>(cellFaces.size());
+           ++c) {
+        if (m_selFaces.contains(
+                static_cast<int>(cellFaces[static_cast<std::size_t>(c)])))
+          ids->InsertNextValue(c);
+      }
+      if (ids->GetNumberOfTuples() > 0) {
+        auto node = vtkSmartPointer<vtkSelectionNode>::New();
+        node->SetFieldType(vtkSelectionNode::CELL);
+        node->SetContentType(vtkSelectionNode::INDICES);
+        node->SetSelectionList(ids);
+        auto sel = vtkSmartPointer<vtkSelection>::New();
+        sel->AddNode(node);
+        auto extract = vtkSmartPointer<vtkExtractSelection>::New();
+        extract->SetInputData(0, polyIt.value());
+        extract->SetInputData(1, sel);
+        extract->Update();
+        auto mapper = vtkSmartPointer<vtkDataSetMapper>::New();
+        mapper->SetInputConnection(extract->GetOutputPort());
+        mapper->ScalarVisibilityOff();
+        mapper->SetResolveCoincidentTopologyToPolygonOffset();
+        m_selectActor = vtkSmartPointer<vtkActor>::New();
+        m_selectActor->SetMapper(mapper);
+        m_selectActor->GetProperty()->SetColor(1.0, 1.0, 0.0);
+        m_selectActor->GetProperty()->EdgeVisibilityOn();
+        m_selectActor->GetProperty()->SetEdgeColor(0.6, 0.6, 0.0);
+        m_selectActor->PickableOff();
+        m_renderer->AddActor(m_selectActor);
+      }
+    }
+  }
+
+  // Selected feature edges: one line cell per FeatureEdges::edges entry, so
+  // the selected ids are VTK cell ids. Draw them brighter and thicker.
+  if (!m_selEdges.isEmpty()) {
+    const auto polyIt = m_stageFeaturePoly.find(m_selStage);
+    if (polyIt != m_stageFeaturePoly.end()) {
+      auto ids = vtkSmartPointer<vtkIdTypeArray>::New();
+      const vtkIdType cellCount = polyIt.value()->GetNumberOfCells();
+      for (int edge : m_selEdges) {
+        if (edge >= 0 && edge < cellCount)
+          ids->InsertNextValue(edge);
+      }
+      if (ids->GetNumberOfTuples() > 0) {
+        auto node = vtkSmartPointer<vtkSelectionNode>::New();
+        node->SetFieldType(vtkSelectionNode::CELL);
+        node->SetContentType(vtkSelectionNode::INDICES);
+        node->SetSelectionList(ids);
+        auto sel = vtkSmartPointer<vtkSelection>::New();
+        sel->AddNode(node);
+        auto extract = vtkSmartPointer<vtkExtractSelection>::New();
+        extract->SetInputData(0, polyIt.value());
+        extract->SetInputData(1, sel);
+        extract->Update();
+        auto mapper = vtkSmartPointer<vtkDataSetMapper>::New();
+        mapper->SetInputConnection(extract->GetOutputPort());
+        mapper->ScalarVisibilityOff();
+        mapper->SetResolveCoincidentTopologyToPolygonOffset();
+        mapper->SetRelativeCoincidentTopologyLineOffsetParameters(-1.0, -3.0);
+        m_edgeSelectActor = vtkSmartPointer<vtkActor>::New();
+        m_edgeSelectActor->SetMapper(mapper);
+        m_edgeSelectActor->GetProperty()->SetColor(1.0, 0.95, 0.2);
+        m_edgeSelectActor->GetProperty()->SetLineWidth(8.0);
+        m_edgeSelectActor->GetProperty()->SetLighting(false);
+        m_edgeSelectActor->PickableOff();
+        m_renderer->AddActor(m_edgeSelectActor);
+      }
+    }
+  }
 }
 
 void VtkView::pickSingleCell(const QPoint& pos) {
@@ -641,6 +784,101 @@ void VtkView::pickSingleCell(const QPoint& pos) {
     emit facePicked(static_cast<int>(faces[static_cast<std::size_t>(cell)]));
 }
 
+bool VtkView::pickSingleFeatureEdge(const QPoint& pos) {
+  const auto actorIt = m_featureEdgeActors.find(m_selectStage);
+  const auto polyIt = m_stageFeaturePoly.find(m_selectStage);
+  if (actorIt == m_featureEdgeActors.end() ||
+      polyIt == m_stageFeaturePoly.end() || !m_renderer || !renderWindow())
+    return false;
+
+  // Probe a few pixels around the click with a hardware selector so thin
+  // lines are easy to hit and depth-occluded edges stay unselectable.
+  const qreal dpr = devicePixelRatioF();
+  const int cx = static_cast<int>(pos.x() * dpr);
+  const int cy = static_cast<int>((height() - 1 - pos.y()) * dpr);
+  int* winSize = renderWindow()->GetSize();
+  const int radius = std::max(1, static_cast<int>(std::lround(4.0 * dpr)));
+  const int x0 = std::max(0, cx - radius);
+  const int y0 = std::max(0, cy - radius);
+  const int x1 = std::min(winSize[0] - 1, cx + radius);
+  const int y1 = std::min(winSize[1] - 1, cy + radius);
+  if (x1 < x0 || y1 < y0)
+    return false;
+
+  auto selector = vtkSmartPointer<vtkHardwareSelector>::New();
+  selector->SetRenderer(m_renderer);
+  selector->SetArea(static_cast<unsigned int>(x0),
+                    static_cast<unsigned int>(y0),
+                    static_cast<unsigned int>(x1),
+                    static_cast<unsigned int>(y1));
+  selector->SetFieldAssociation(vtkDataObject::FIELD_ASSOCIATION_CELLS);
+  vtkSmartPointer<vtkSelection> sel;
+  sel.TakeReference(selector->Select());
+  if (!sel)
+    return false;
+
+  // Hardware selection may report several lines near a corner. Project their
+  // endpoints to display space and keep the one nearest the actual click.
+  const auto displayPoint = [this](const double world[3], double out[2]) {
+    m_renderer->SetWorldPoint(world[0], world[1], world[2], 1.0);
+    m_renderer->WorldToDisplay();
+    m_renderer->GetDisplayPoint(out);
+  };
+  const auto pointSegmentDistance = [](double px, double py, const double a[2],
+                                       const double b[2]) {
+    const double dx = b[0] - a[0], dy = b[1] - a[1];
+    const double len2 = dx * dx + dy * dy;
+    double t = 0.0;
+    if (len2 > 0.0)
+      t = ((px - a[0]) * dx + (py - a[1]) * dy) / len2;
+    t = std::clamp(t, 0.0, 1.0);
+    const double qx = a[0] + t * dx, qy = a[1] + t * dy;
+    return std::hypot(px - qx, py - qy);
+  };
+
+  int bestEdge = -1;
+  double bestDist = std::numeric_limits<double>::max();
+  for (unsigned int i = 0; i < sel->GetNumberOfNodes(); ++i) {
+    auto* node = sel->GetNode(i);
+    if (!node ||
+        node->GetProperties()->Get(vtkSelectionNode::PROP()) != actorIt.value())
+      continue;
+    auto* ids = vtkArrayDownCast<vtkIdTypeArray>(node->GetSelectionList());
+    if (!ids)
+      continue;
+    for (vtkIdType k = 0; k < ids->GetNumberOfTuples(); ++k) {
+      const vtkIdType edge = ids->GetValue(k);
+      if (edge < 0 || edge >= polyIt.value()->GetNumberOfCells())
+        continue;
+      vtkCell* cell = polyIt.value()->GetCell(edge);
+      if (!cell || cell->GetNumberOfPoints() < 2)
+        continue;
+      double prev[2] = {0.0, 0.0};
+      double prevWorld[3];
+      cell->GetPoints()->GetPoint(0, prevWorld);
+      displayPoint(prevWorld, prev);
+      double dist = std::numeric_limits<double>::max();
+      for (vtkIdType p = 1; p < cell->GetNumberOfPoints(); ++p) {
+        double cur[2] = {0.0, 0.0};
+        double curWorld[3];
+        cell->GetPoints()->GetPoint(p, curWorld);
+        displayPoint(curWorld, cur);
+        dist = std::min(dist, pointSegmentDistance(cx, cy, prev, cur));
+        prev[0] = cur[0];
+        prev[1] = cur[1];
+      }
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestEdge = static_cast<int>(edge);
+      }
+    }
+  }
+  if (bestEdge < 0)
+    return false;
+  emit featureEdgePicked(bestEdge);
+  return true;
+}
+
 void VtkView::pickRect(const QPoint& a, const QPoint& b) {
   const auto it = m_stageActors.find(m_selectStage);
   if (it == m_stageActors.end() || !m_renderer)
@@ -662,23 +900,42 @@ void VtkView::pickRect(const QPoint& a, const QPoint& b) {
   if (!sel)
     return;
   QSet<int> faces;
+  QSet<int> edges;
   const auto& cellFaces = m_stageCellFaces.value(m_selectStage);
+  const auto edgeActorIt = m_featureEdgeActors.find(m_selectStage);
+  const auto featurePolyIt = m_stageFeaturePoly.find(m_selectStage);
   for (unsigned int i = 0; i < sel->GetNumberOfNodes(); ++i) {
     auto* node = sel->GetNode(i);
-    if (!node ||
-        node->GetProperties()->Get(vtkSelectionNode::PROP()) != it.value())
+    if (!node)
       continue;
     auto* ids = vtkArrayDownCast<vtkIdTypeArray>(node->GetSelectionList());
     if (!ids)
       continue;
+    const bool isMesh =
+        node->GetProperties()->Get(vtkSelectionNode::PROP()) == it.value();
+    const bool isEdges =
+        edgeActorIt != m_featureEdgeActors.end() &&
+        node->GetProperties()->Get(vtkSelectionNode::PROP()) ==
+            edgeActorIt.value();
+    if (!isMesh && !isEdges)
+      continue;
     for (vtkIdType k = 0; k < ids->GetNumberOfTuples(); ++k) {
       const vtkIdType c = ids->GetValue(k);
-      if (c >= 0 && c < static_cast<vtkIdType>(cellFaces.size()))
-        faces.insert(static_cast<int>(cellFaces[static_cast<std::size_t>(c)]));
+      if (isMesh) {
+        if (c >= 0 && c < static_cast<vtkIdType>(cellFaces.size()))
+          faces.insert(
+              static_cast<int>(cellFaces[static_cast<std::size_t>(c)]));
+      } else if (c >= 0 && featurePolyIt != m_stageFeaturePoly.end() &&
+                 c < featurePolyIt.value()->GetNumberOfCells()) {
+        // One line cell per FeatureEdges::edges entry.
+        edges.insert(static_cast<int>(c));
+      }
     }
   }
   if (!faces.isEmpty())
     emit facesSelected(faces);
+  if (!edges.isEmpty())
+    emit featureEdgesSelected(edges);
 }
 
 void VtkView::mousePressEvent(QMouseEvent* e) {
@@ -712,10 +969,14 @@ void VtkView::mouseReleaseEvent(QMouseEvent* e) {
   m_selectPressed = false;
   if (m_band)
     m_band->hide();
-  if ((e->pos() - m_pressPos).manhattanLength() < 4)
-    pickSingleCell(e->pos());
-  else
+  if ((e->pos() - m_pressPos).manhattanLength() < 4) {
+    // A click on a drawn feature edge targets that edge; anything else
+    // falls through to the usual triangle toggle.
+    if (!pickSingleFeatureEdge(e->pos()))
+      pickSingleCell(e->pos());
+  } else {
     pickRect(m_pressPos, e->pos());
+  }
   e->accept();
 }
 

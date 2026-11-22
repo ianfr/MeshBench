@@ -56,6 +56,13 @@ public:
   void clear();
   void resetCamera();
 
+  // Export the current scene as PNG. width/height <= 0 use the widget's
+  // current size. sceneImagePng returns the bytes for MCP tool results;
+  // saveSceneImage writes them to disk (File > Export scene image).
+  bool sceneImagePng(int width, int height, QByteArray& png, QString& error);
+  bool saveSceneImage(const QString& path, int width, int height,
+                      QString& error);
+
   // Snap the active camera to a standard +/-X, +/-Y or +/-Z view. Keeps
   // the current focal point and camera distance, like ParaView's axis
   // toolbar, and uses the scene's up-axis conventions.
@@ -66,12 +73,16 @@ public:
 
   // Selection mode (toggled with the 'S' shortcut): single clicks toggle
   // individual triangles, click-and-drag draws a rubber-band rectangle
-  // selecting every triangle inside (added to the set). Selection faces
-  // are target-mesh face indices (same id space as facePicked). The
-  // current set renders as a yellow highlight overlay.
+  // selecting every triangle inside (added to the set). Clicking directly on
+  // a drawn feature edge toggles that edge instead of a triangle, and a drag
+  // rectangle also adds feature edges inside it. Selection faces are
+  // target-mesh face indices (same id space as facePicked); feature edges are
+  // FeatureEdges::edges indices. Faces render as a yellow highlight, selected
+  // edges as a brighter yellow line overlay.
   void setSelectMode(bool on, int stage = -1);
   bool selectMode() const { return m_selectMode; }
   void setSelection(int stage, const QSet<int>& faces);
+  void setEdgeSelection(int stage, const QSet<int>& edges);
 
   // Overlay toggles for the active LeakProbe stage (both default off).
   void setShowLeakPaths(bool on) { m_showLeakPaths = on; }
@@ -82,6 +93,10 @@ signals:
   void facePicked(int faceIdx);
   // Target-mesh face indices inside a rubber-band rectangle (additive).
   void facesSelected(const QSet<int>& faces);
+  // FeatureEdges::edges index clicked in selection mode.
+  void featureEdgePicked(int edgeIdx);
+  // Feature-edge indices inside a rubber-band rectangle (additive).
+  void featureEdgesSelected(const QSet<int>& edges);
 
 private:
   vtkSmartPointer<vtkRenderer> m_renderer;
@@ -94,11 +109,15 @@ private:
   QMap<int, vtkSmartPointer<vtkActor>> m_stageActors;
   // Per-stage VTK cell id -> target-mesh face idx (display triangulates).
   QMap<int, std::vector<std::size_t>> m_stageCellFaces;
+  // Feature-edge stages draw one line cell per FeatureEdges::edges entry, so
+  // the VTK cell id is also the feature-edge index.
+  QMap<int, vtkSmartPointer<vtkActor>> m_featureEdgeActors;
   std::vector<vtkSmartPointer<vtkActor>> m_overlayActors;
 
   vtkSmartPointer<vtkActor> meshActor(const Mesh& mesh, double r, double g,
                                       double b, double opacity,
                                       std::vector<std::size_t>& cellFaces);
+  vtkSmartPointer<vtkActor> featureEdgeActor(const FeatureEdges& edges);
 protected:
   void showEvent(QShowEvent* e) override;
   void mousePressEvent(QMouseEvent* e) override;
@@ -126,8 +145,11 @@ protected:
   // cells after a rebuild without touching the mesh).
   // (Cell order matches m_stageCellFaces, so faces map 1:1.)
   QMap<int, vtkSmartPointer<vtkPolyData>> m_stagePoly;
+  QMap<int, vtkSmartPointer<vtkPolyData>> m_stageFeaturePoly;
   vtkSmartPointer<vtkActor> m_selectActor;
+  vtkSmartPointer<vtkActor> m_edgeSelectActor;
   QSet<int> m_selFaces;
+  QSet<int> m_selEdges;
   int m_selStage = -1;
   bool m_selectPressed = false;
   QPoint m_pressPos;
@@ -135,6 +157,7 @@ protected:
 
   void updateSelectionHighlight();
   void pickSingleCell(const QPoint& pos);
+  bool pickSingleFeatureEdge(const QPoint& pos);
   void pickRect(const QPoint& a, const QPoint& b);
 };
 

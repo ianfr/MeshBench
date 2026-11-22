@@ -103,6 +103,57 @@ private slots:
     QVERIFY(resolveStageSelection(explicitPicks, treePicks) == explicitPicks);
     QVERIFY(resolveStageSelection({}, treePicks) == treePicks);
   }
+
+  // Deleting a stage must also remove its downstream operation chain,
+  // while leaving independent sources and their chains intact.
+  void deletingStageRemovesDownstreamOnly() {
+    MeshDocument doc;
+    doc.setSource(testutil::makeClosedCube(), QStringLiteral("RootA"));
+    doc.appendOperation(QStringLiteral("OpA1"), QString(),
+                        testutil::makeClosedCube());
+    doc.appendOperation(QStringLiteral("OpA2"), QString(),
+                        testutil::makeClosedCube());
+    doc.appendSource(QStringLiteral("RootB"), testutil::makeClosedCube());
+    doc.appendOperation(QStringLiteral("OpB1"), QString(),
+                        testutil::makeClosedCube());
+    QCOMPARE(doc.nodeCount(), 5);
+    QCOMPARE(doc.activeIndex(), 4);
+
+    // Removing OpA1 drops OpA2; RootB and OpB1 are independent.
+    const QMap<int, int> map = doc.removeNodes(QSet<int>{1});
+    QCOMPARE(doc.nodeCount(), 3);
+    QCOMPARE(doc.node(0).label, QStringLiteral("RootA"));
+    QCOMPARE(doc.node(1).label, QStringLiteral("RootB"));
+    QCOMPARE(doc.node(2).label, QStringLiteral("OpB1"));
+    QCOMPARE(doc.node(1).parent, -1);
+    QCOMPARE(doc.node(2).parent, 1); // remapped from old index 3
+    QCOMPARE(doc.activeIndex(), 2);
+    QCOMPARE(map.value(0), 0);
+    QVERIFY(!map.contains(1));
+    QVERIFY(!map.contains(2));
+    QCOMPARE(map.value(3), 1);
+    QCOMPARE(map.value(4), 2);
+
+    // Removing RootB also drops its downstream OpB1.
+    doc.removeNodes(QSet<int>{1});
+    QCOMPARE(doc.nodeCount(), 1);
+    QCOMPARE(doc.node(0).label, QStringLiteral("RootA"));
+    QCOMPARE(doc.activeIndex(), 0);
+  }
+
+  void deletingActiveMiddleStageFallsBack() {
+    MeshDocument doc;
+    doc.setSource(testutil::makeClosedCube(), QStringLiteral("Root"));
+    doc.appendOperation(QStringLiteral("Op1"), QString(),
+                        testutil::makeClosedCube());
+    doc.appendOperation(QStringLiteral("Op2"), QString(),
+                        testutil::makeClosedCube());
+    doc.setActive(1);
+    doc.removeNodes(QSet<int>{1});
+    QCOMPARE(doc.nodeCount(), 1);
+    QCOMPARE(doc.node(0).label, QStringLiteral("Root"));
+    QCOMPARE(doc.activeIndex(), 0);
+  }
 };
 
 QTEST_MAIN(TstMeshDocument)

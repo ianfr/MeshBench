@@ -1,7 +1,13 @@
 #include "MainWindow.h"
 #include "LeakFix.h"
 #include "MeshOps.h"
+#include "OperationSearch.h"
 #include "StageSelection.h"
+
+#include "McpHttpServer.h"
+#include "McpProtocol.h"
+
+#include "GmshCadSession.h"
 
 #include <QAction>
 #include <QCheckBox>
@@ -15,7 +21,10 @@
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QKeyEvent>
 #include <QLabel>
+#include <QLineEdit>
+#include <QListWidget>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
@@ -37,6 +46,47 @@
 
 namespace meshbench {
 
+namespace {
+// Search field for the Ctrl+Space operation launcher: Up/Down move the
+// result selection without leaving the text box, so typing and choosing an
+// operation stay in one place.
+class OperationSearchLineEdit : public QLineEdit {
+public:
+  using QLineEdit::QLineEdit;
+  QListWidget* results = nullptr;
+
+protected:
+  void keyPressEvent(QKeyEvent* e) override {
+    if (results && (e->key() == Qt::Key_Down || e->key() == Qt::Key_Up)) {
+      const int count = results->count();
+      if (count == 0)
+        return;
+      const int step = e->key() == Qt::Key_Down ? 1 : -1;
+      if (results->currentRow() < 0) {
+        for (int i = 0; i < count; ++i) {
+          const int row = step > 0 ? i : count - 1 - i;
+          if (!results->item(row)->isHidden()) {
+            results->setCurrentRow(row);
+            break;
+          }
+        }
+        return;
+      }
+      int row = results->currentRow();
+      for (int n = 0; n < count; ++n) {
+        row = (row + step + count) % count;
+        if (!results->item(row)->isHidden()) {
+          results->setCurrentRow(row);
+          break;
+        }
+      }
+      return;
+    }
+    QLineEdit::keyPressEvent(e);
+  }
+};
+} // namespace
+
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   setWindowTitle(QStringLiteral("MeshBench"));
   resize(1280, 800);
@@ -46,14 +96,28 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
                       &MainWindow::openMesh);
   fileMenu->addAction(QStringLiteral("Import meshes..."), this,
                       &MainWindow::importMeshes);
+  fileMenu->addAction(QStringLiteral("Import feature edges (eMesh)..."), this,
+                      &MainWindow::importFeatureEdges);
   fileMenu->addAction(QStringLiteral("Save active stage..."), QKeySequence::Save,
                       this, &MainWindow::saveActiveMesh);
+  fileMenu->addAction(QStringLiteral("Export scene image..."), this,
+                      &MainWindow::exportSceneImage);
+  fileMenu->addAction(QStringLiteral("Export feature edges as eMesh..."), this,
+                      &MainWindow::saveActiveFeatureEdges);
   fileMenu->addSeparator();
   fileMenu->addAction(QStringLiteral("Clear"), this, &MainWindow::clearAll);
   fileMenu->addAction(QStringLiteral("Quit"), QKeySequence::Quit, this,
                       &QWidget::close);
 
   auto* opsMenu = menuBar()->addMenu(QStringLiteral("&Operations"));
+  m_operationsMenu = opsMenu;
+  m_operationsSearchAction =
+      opsMenu->addAction(QStringLiteral("Search operations..."), this,
+                         &MainWindow::showOperationsSearch);
+  m_operationsSearchAction->setShortcut(
+      QKeySequence(QStringLiteral("Ctrl+Space")));
+  m_operationsSearchAction->setShortcutContext(Qt::WindowShortcut);
+  opsMenu->addSeparator();
   opsMenu->addAction(QStringLiteral("Boolean with another mesh..."), this,
                      &MainWindow::runBoolean);
   opsMenu->addAction(QStringLiteral("Center at volume center"), this,
@@ -61,6 +125,14 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   opsMenu->addAction(QStringLiteral("Transform (translate/rotate)..."), this,
                      &MainWindow::runTransform);
   opsMenu->addAction(QStringLiteral("Alpha wrap..."), this, &MainWindow::runAlphaWrap);
+  opsMenu->addAction(QStringLiteral("Isotropic remesh..."), this,
+                     &MainWindow::runIsotropicRemesh);
+  opsMenu->addAction(QStringLiteral("Extract feature edges..."), this,
+                     &MainWindow::runExtractFeatureEdges);
+  opsMenu->addAction(QStringLiteral("Snap to feature edges..."), this,
+                     &MainWindow::runSnapToFeatureEdges);
+  opsMenu->addAction(QStringLiteral("Autoclean (experimental)..."), this,
+                     &MainWindow::runAutoClean);
   opsMenu->addAction(QStringLiteral("Slice with plane..."), this, &MainWindow::runClip);
   opsMenu->addSeparator();
   opsMenu->addAction(QStringLiteral("Combine selected stages..."), this,
@@ -72,13 +144,11 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
                      &MainWindow::runIntroduceHoles);
   opsMenu->addAction(QStringLiteral("Shrinkwrap..."), this,
                      &MainWindow::runShrinkwrap);
-#ifdef MESHBENCH_HAVE_GMSH
   opsMenu->addSeparator();
   opsMenu->addAction(QStringLiteral("Create primitive shape..."), this,
                      &MainWindow::runCreatePrimitive);
   opsMenu->addAction(QStringLiteral("Remesh with Gmsh..."), this,
                      &MainWindow::runGmshRemesh);
-#endif
   auto* viewMenu = menuBar()->addMenu(QStringLiteral("&View"));
   viewMenu->addAction(QStringLiteral("View from +X"), this,
                       [this] { m_view->setStandardView(StandardView::PosX); });
@@ -111,6 +181,10 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   connect(m_tree, &QTreeWidget::itemChanged, this, &MainWindow::onTreeItemChanged);
   connect(m_tree, &QTreeWidget::itemDoubleClicked, this,
           &MainWindow::onTreeItemActivated);
+  auto* deleteShortcut = new QShortcut(QKeySequence::Delete, m_tree);
+  deleteShortcut->setContext(Qt::WidgetShortcut);
+  connect(deleteShortcut, &QShortcut::activated, this,
+          &MainWindow::deleteSelectedStages);
   connect(m_tree, &QWidget::customContextMenuRequested, this, [this](const QPoint& p) {
     if (auto* item = m_tree->itemAt(p)) {
       // Read the index up front: activating a stage rebuilds the tree and
@@ -152,6 +226,8 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
                      });
       menu.addAction(QStringLiteral("Revert to this stage (drop later ops)"),
                      this, &MainWindow::revertToSelectedStage);
+      menu.addAction(QStringLiteral("Delete this stage (and downstream)"),
+                     this, [this, idx] { deleteStages(QSet<int>{idx}); });
       menu.addAction(QStringLiteral("Combine selected stages..."), this,
                      &MainWindow::runCombineSelected);
       menu.exec(m_tree->viewport()->mapToGlobal(p));
@@ -250,13 +326,15 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   auto* selBox = new QWidget(right);
   auto* selLayout = new QVBoxLayout(selBox);
   selLayout->addWidget(new QLabel(
-      QStringLiteral("<b>Selection</b> (S in viewport: click or drag)"),
+      QStringLiteral("<b>Selection</b> (S; click faces or amber edges)"),
       selBox));
   m_selectBtn = new QPushButton(QStringLiteral("Select (S)"), selBox);
   m_selectBtn->setCheckable(true);
   m_selectBtn->setToolTip(QStringLiteral(
       "Pick triangles on the active stage: click toggles one, drag selects "
-      "a rectangle. Filters below run on the selected subset."));
+      "a rectangle. Click an amber feature edge to select that edge. "
+      "Leaving selection mode applies the selection as deletions in a new "
+      "stage; the active stage is never modified."));
   selLayout->addWidget(m_selectBtn);
   m_selectLabel = new QLabel(QStringLiteral("No selection."), selBox);
   m_selectLabel->setWordWrap(true);
@@ -269,20 +347,38 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   selLayout->addLayout(selBtns);
   auto* selBtns2 = new QHBoxLayout();
   auto* extractSel = new QPushButton(QStringLiteral("Extract as stage"), selBox);
+  auto* deleteSelBtn = new QPushButton(QStringLiteral("Delete selected"), selBox);
   auto* clearSelBtn = new QPushButton(QStringLiteral("Clear"), selBox);
   selBtns2->addWidget(extractSel);
+  selBtns2->addWidget(deleteSelBtn);
   selBtns2->addWidget(clearSelBtn);
   selLayout->addLayout(selBtns2);
   rightLayout->addWidget(selBox);
   connect(m_selectBtn, &QPushButton::toggled, this,
           &MainWindow::toggleSelectMode);
   connect(m_view, &VtkView::facesSelected, this, &MainWindow::onFacesSelected);
+  connect(m_view, &VtkView::featureEdgePicked, this,
+          &MainWindow::onFeatureEdgePicked);
+  connect(m_view, &VtkView::featureEdgesSelected, this,
+          &MainWindow::onFeatureEdgesSelected);
   connect(remeshSel, &QPushButton::clicked, this,
           &MainWindow::runRemeshSelection);
   connect(detectSel, &QPushButton::clicked, this,
           &MainWindow::runDetectLeaksSelection);
   connect(extractSel, &QPushButton::clicked, this,
           &MainWindow::runExtractSelection);
+  connect(deleteSelBtn, &QPushButton::clicked, this, [this] {
+    if (m_selection.isEmpty() && m_selectedEdges.isEmpty()) {
+      QMessageBox::information(this, QStringLiteral("MeshBench"),
+                               QStringLiteral("Select faces or feature edges "
+                                              "first (S in the viewport)."));
+      return;
+    }
+    if (m_selectBtn && m_selectBtn->isChecked())
+      m_selectBtn->setChecked(false); // exits and commits the deletions
+    else if (commitSelectionDeletions())
+      updateSelectPanel();
+  });
   connect(clearSelBtn, &QPushButton::clicked, this, &MainWindow::clearSelection);
   auto* selectShortcut = new QShortcut(QKeySequence(QStringLiteral("s")), m_view);
   selectShortcut->setContext(Qt::WidgetShortcut);
@@ -359,22 +455,134 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   connect(&m_doc, &MeshDocument::activeChanged, this, &MainWindow::refreshAll);
 
   log(QStringLiteral("MeshBench ready. File > Open mesh to begin."));
-#ifdef MESHBENCH_HAVE_GMSH
   log(QStringLiteral("Gmsh %1 available.").arg(gmshVersion()));
-#else
-  log(QStringLiteral("Gmsh support not compiled in; remeshing disabled."));
-#endif
+  startMcpServer();
+}
+
+MainWindow::~MainWindow() {
+  // Stop the HTTP server (and join its thread) before any UI member is
+  // destroyed: pending handlers must never touch a half-destructed window.
+  m_mcpShuttingDown.store(true);
+  if (m_gmshCad)
+    m_gmshCad->abort();
+  if (m_mcpServer)
+    m_mcpServer->stop();
 }
 
 void MainWindow::log(const QString& msg) {
   m_log->appendPlainText(msg);
 }
 
+void MainWindow::showOperationsSearch() {
+  if (!m_operationsMenu)
+    return;
+  QList<QAction*> actions;
+  for (QAction* action : m_operationsMenu->actions()) {
+    if (!action || action->isSeparator() || action == m_operationsSearchAction ||
+        !action->isEnabled())
+      continue;
+    actions.append(action);
+  }
+  if (actions.isEmpty())
+    return;
+
+  QDialog dlg(this);
+  dlg.setWindowTitle(QStringLiteral("Operations"));
+  dlg.resize(560, 420);
+  auto* layout = new QVBoxLayout(&dlg);
+  auto* search = new OperationSearchLineEdit(&dlg);
+  search->setPlaceholderText(QStringLiteral("Search operations..."));
+  layout->addWidget(search);
+  auto* hint = new QLabel(
+      QStringLiteral("Type to filter. Enter or double-click runs an operation."),
+      &dlg);
+  hint->setEnabled(false);
+  layout->addWidget(hint);
+  auto* list = new QListWidget(&dlg);
+  list->setSelectionMode(QAbstractItemView::SingleSelection);
+  layout->addWidget(list, 1);
+  search->results = list;
+
+  for (int i = 0; i < actions.size(); ++i) {
+    auto* item = new QListWidgetItem(actions[i]->text(), list);
+    item->setData(Qt::UserRole, i);
+  }
+
+  QAction* chosen = nullptr;
+  const auto choose = [&](QListWidgetItem* item) {
+    if (!item || item->isHidden())
+      return;
+    const int index = item->data(Qt::UserRole).toInt();
+    if (index >= 0 && index < actions.size()) {
+      chosen = actions[index];
+      dlg.accept();
+    }
+  };
+  const auto chooseCurrent = [&] {
+    QListWidgetItem* item = list->currentItem();
+    if (!item || item->isHidden()) {
+      for (int i = 0; i < list->count(); ++i) {
+        if (!list->item(i)->isHidden()) {
+          item = list->item(i);
+          break;
+        }
+      }
+    }
+    choose(item);
+  };
+  const auto applyFilter = [&] {
+    const QString query = search->text();
+    QListWidgetItem* firstVisible = nullptr;
+    for (int i = 0; i < list->count(); ++i) {
+      QListWidgetItem* item = list->item(i);
+      const bool match = operationSearchMatches(item->text(), query);
+      item->setHidden(!match);
+      if (match && !firstVisible)
+        firstVisible = item;
+    }
+    if (firstVisible &&
+        (!list->currentItem() || list->currentItem()->isHidden()))
+      list->setCurrentItem(firstVisible);
+  };
+
+  connect(search, &QLineEdit::textChanged, &dlg,
+          [&](const QString&) { applyFilter(); });
+  connect(search, &QLineEdit::returnPressed, &dlg, chooseCurrent);
+  connect(list, &QListWidget::itemActivated, &dlg,
+          [&](QListWidgetItem* item) { choose(item); });
+  applyFilter();
+  search->setFocus();
+  dlg.move(frameGeometry().center() -
+           QPoint(dlg.width() / 2, dlg.height() / 2));
+  if (dlg.exec() == QDialog::Accepted && chosen)
+    chosen->trigger();
+}
+
 bool MainWindow::requireMesh() const {
-  if (!m_doc.hasMesh()) {
+  if (!m_doc.hasMesh() || m_doc.activeMesh().num_vertices() == 0) {
     QMessageBox::information(const_cast<MainWindow*>(this),
                              QStringLiteral("MeshBench"),
-                             QStringLiteral("Open a mesh first."));
+                             QStringLiteral("Open or activate a stage with a "
+                                            "surface mesh first."));
+    return false;
+  }
+  return true;
+}
+
+bool MainWindow::ensureActiveMesh(QString& error) const {
+  error.clear();
+  if (!m_doc.hasMesh() || m_doc.nodeCount() == 0) {
+    error = QStringLiteral("No mesh loaded. Use file_open_mesh or "
+                           "file_import_meshes first.");
+    return false;
+  }
+  if (m_doc.activeIndex() < 0 || m_doc.activeIndex() >= m_doc.nodeCount()) {
+    error = QStringLiteral("The active stage index is out of range.");
+    return false;
+  }
+  if (m_doc.activeMesh().num_vertices() == 0) {
+    error = QStringLiteral("The active stage has no surface mesh. Activate a "
+                           "mesh stage first.");
     return false;
   }
   return true;
@@ -420,13 +628,23 @@ void MainWindow::openMesh() {
       QStringLiteral("Meshes (*.stl *.off *.obj);;All files (*)"));
   if (path.isEmpty())
     return;
-  Mesh mesh;
   QString error;
-  if (!loadMesh(path, mesh, error)) {
+  if (!loadMeshFile(path, error))
     QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
-    return;
+}
+
+bool MainWindow::loadMeshFile(const QString& path, QString& error) {
+  error.clear();
+  if (path.isEmpty()) {
+    error = QStringLiteral("No mesh path given.");
+    return false;
   }
+  Mesh mesh;
+  if (!loadMesh(path, mesh, error))
+    return false;
   const MeshStats s = computeStats(mesh);
+  // Loading a new document invalidates any pending viewport selection.
+  cancelSelectionSession();
   m_stageSelection.clear();
   m_tree->clearSelection();
   m_doc.setSource(std::move(mesh), QFileInfo(path).fileName());
@@ -440,22 +658,45 @@ void MainWindow::openMesh() {
           .arg(s.boundaryEdges));
   if (!s.closed)
     log(QStringLiteral("Note: mesh is not watertight; use Detect leaks / Patch holes."));
+  // Exit check: the document must hold the newly loaded source stage.
+  if (!m_doc.hasMesh() || m_doc.nodeCount() != 1) {
+    error = QStringLiteral("Failed to install the loaded mesh.");
+    return false;
+  }
+  return true;
 }
 
 void MainWindow::importMeshes() {
   const QStringList paths = QFileDialog::getOpenFileNames(
       this, QStringLiteral("Import meshes"), {},
       QStringLiteral("Meshes (*.stl *.off *.obj);;All files (*)"));
+  if (paths.isEmpty())
+    return;
+  QString error;
+  if (!importMeshFiles(paths, error) && !error.isEmpty())
+    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
+}
+
+bool MainWindow::importMeshFiles(const QStringList& paths, QString& error) {
+  error.clear();
+  if (paths.isEmpty()) {
+    error = QStringLiteral("No mesh paths given.");
+    return false;
+  }
+  int loaded = 0;
+  QStringList failures;
   for (const QString& path : paths) {
     Mesh mesh;
-    QString error;
-    if (!loadMesh(path, mesh, error)) {
-      QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
+    QString loadError;
+    if (!loadMesh(path, mesh, loadError)) {
+      failures.append(QStringLiteral("%1: %2").arg(path, loadError));
       continue;
     }
     const MeshStats s = computeStats(mesh);
     m_doc.appendSource(QFileInfo(path).fileName(), std::move(mesh));
     m_visible.insert(m_doc.activeIndex());
+    refreshView();
+    ++loaded;
     log(QStringLiteral("Imported %1: %2 verts, %3 faces, %4 boundary edges.")
             .arg(path)
             .arg(s.vertices)
@@ -464,6 +705,59 @@ void MainWindow::importMeshes() {
     if (!s.closed)
       log(QStringLiteral("Note: mesh is not watertight; use Detect leaks / Patch holes."));
   }
+  if (loaded == 0) {
+    error = failures.isEmpty() ? QStringLiteral("No meshes imported.")
+                               : failures.join(QStringLiteral("\n"));
+    return false;
+  }
+  if (!failures.isEmpty())
+    log(QStringLiteral("Import warnings: %1").arg(failures.join(QStringLiteral("; "))));
+  return true;
+}
+
+void MainWindow::importFeatureEdges() {
+  const QString path = QFileDialog::getOpenFileName(
+      this, QStringLiteral("Import feature edges (eMesh)"), {},
+      QStringLiteral("OpenFOAM eMesh (*.eMesh *.emesh);;All files (*)"));
+  if (path.isEmpty())
+    return;
+  QString error;
+  if (!importFeatureEdgesFile(path, error))
+    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
+}
+
+bool MainWindow::importFeatureEdgesFile(const QString& path, QString& error) {
+  error.clear();
+  if (path.isEmpty()) {
+    error = QStringLiteral("No feature-edge path given.");
+    return false;
+  }
+  FeatureEdges edges;
+  if (!loadFeatureEdges(path, edges, error))
+    return false;
+  const int edgeCount = static_cast<int>(edges.edges.size());
+  const QString fileName = QFileInfo(path).fileName();
+  if (m_doc.hasMesh() && m_doc.activeMesh().num_vertices() > 0) {
+    // Overlay imported edges on the active surface.
+    const int source = m_doc.activeIndex();
+    Mesh base = m_doc.activeMesh();
+    m_doc.appendOperation(
+        QStringLiteral("FeatureEdges"),
+        QStringLiteral("imported %1 (%2 edges)").arg(fileName).arg(edgeCount),
+        std::move(base), std::move(edges));
+    m_visible.remove(source);
+  } else {
+    // No surface stage: import the eMesh as an independent edge object.
+    m_doc.appendSource(QStringLiteral("eMesh: %1").arg(fileName), Mesh(),
+                       std::move(edges));
+  }
+  m_visible.insert(m_doc.activeIndex());
+  refreshView();
+  log(QStringLiteral("Imported %1: %2 points, %3 feature edges.")
+          .arg(fileName)
+          .arg(m_doc.node(m_doc.activeIndex()).featureEdges.points.size())
+          .arg(edgeCount));
+  return true;
 }
 
 void MainWindow::runCombineSelected() {
@@ -500,10 +794,31 @@ void MainWindow::runCombineSelected() {
   connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
   if (dlg.exec() != QDialog::Accepted)
     return;
+  const bool unionMode = combo->currentIndex() == 1;
+  QString error;
+  if (!applyCombine(idx, unionMode, error))
+    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
+}
+
+bool MainWindow::applyCombine(const QList<int>& stages, bool unionMode,
+                              QString& error) {
+  error.clear();
+  if (!ensureActiveMesh(error) && stages.isEmpty())
+    return false;
+  QList<int> idx;
+  for (int i : stages) {
+    if (i >= 0 && i < m_doc.nodeCount())
+      idx.append(i);
+  }
+  std::sort(idx.begin(), idx.end());
+  if (idx.size() < 2) {
+    error = QStringLiteral("Select two or more pipeline stages to combine.");
+    return false;
+  }
+
   Mesh out;
   QString details;
-  QString error;
-  if (combo->currentIndex() == 0) {
+  if (!unionMode) {
     std::vector<const Mesh*> inputs;
     for (int i : idx)
       inputs.push_back(&m_doc.node(i).mesh);
@@ -515,10 +830,10 @@ void MainWindow::runCombineSelected() {
       Mesh next;
       if (!booleanOp(out, m_doc.node(idx[k]).mesh, BooleanOp::Union, next,
                      error)) {
-        QMessageBox::warning(
-            this, QStringLiteral("MeshBench"),
-            QStringLiteral("Union failed at stage %1: %2").arg(idx[k]).arg(error));
-        return;
+        error = QStringLiteral("Union failed at stage %1: %2")
+                    .arg(idx[k])
+                    .arg(error);
+        return false;
       }
       out = std::move(next);
     }
@@ -526,16 +841,126 @@ void MainWindow::runCombineSelected() {
   }
   const MeshStats s = computeStats(out);
   if (s.faces == 0) {
-    QMessageBox::warning(this, QStringLiteral("MeshBench"),
-                         QStringLiteral("Combine produced an empty mesh."));
-    return;
+    error = QStringLiteral("Combine produced an empty mesh.");
+    return false;
   }
   m_doc.appendOperation(QStringLiteral("Combine"), details, std::move(out));
   m_visible.insert(m_doc.activeIndex());
+  refreshView();
   log(QStringLiteral("Combined %1 stages (%2): %3 faces.")
           .arg(idx.size())
           .arg(details)
           .arg(s.faces));
+  return true;
+}
+
+void MainWindow::deleteSelectedStages() {
+  QSet<int> picked;
+  for (const auto* item : m_tree->selectedItems())
+    picked.insert(item->data(0, Qt::UserRole).toInt());
+  if (picked.isEmpty()) {
+    log(QStringLiteral("Delete: select one or more pipeline stages first."));
+    return;
+  }
+  deleteStages(picked);
+}
+
+void MainWindow::deleteStages(const QSet<int>& stages) {
+  if (!m_doc.hasMesh() || stages.isEmpty())
+    return;
+  QSet<int> requested;
+  for (int stage : stages) {
+    if (stage >= 0 && stage < m_doc.nodeCount())
+      requested.insert(stage);
+  }
+  if (requested.isEmpty())
+    return;
+
+  const int oldCount = m_doc.nodeCount();
+  const int oldActive = m_doc.activeIndex();
+  // Leaving these modes on would leave them targeting stale indices.
+  if (m_pickBtn && m_pickBtn->isChecked())
+    m_pickBtn->setChecked(false);
+  cancelSelectionSession();
+
+  QMap<int, int> mapping;
+  {
+    // Remap every UI-side stage index before any refresh runs.
+    const QSignalBlocker blocker(&m_doc);
+    mapping = m_doc.removeNodes(requested);
+  }
+  const int removed = oldCount - mapping.size();
+  if (removed <= 0)
+    return; // safety: nothing was actually removed
+
+  QSet<int> visible;
+  for (int old : m_visible) {
+    if (mapping.contains(old))
+      visible.insert(mapping.value(old));
+  }
+  m_visible = visible;
+
+  QSet<int> stageSelection;
+  for (int old : m_stageSelection) {
+    if (mapping.contains(old))
+      stageSelection.insert(mapping.value(old));
+  }
+  m_stageSelection = stageSelection;
+
+  if (m_selectionStage >= 0 && mapping.contains(m_selectionStage)) {
+    m_selectionStage = mapping.value(m_selectionStage);
+  } else {
+    m_selectionStage = -1;
+    m_selection.clear();
+  }
+
+  int wrapSource = m_wrapSource;
+  int wrapStage = m_wrapStage;
+  bool wrapLost = false;
+  if (wrapSource >= 0) {
+    if (mapping.contains(wrapSource))
+      wrapSource = mapping.value(wrapSource);
+    else
+      wrapLost = true;
+  }
+  if (wrapStage >= 0) {
+    if (mapping.contains(wrapStage))
+      wrapStage = mapping.value(wrapStage);
+    else
+      wrapLost = true;
+  }
+  if (wrapLost) {
+    m_wrapSource = -1;
+    m_wrapStage = -1;
+    m_faceWeights.clear();
+    m_faceSelection.clear();
+  } else {
+    m_wrapSource = wrapSource;
+    m_wrapStage = wrapStage;
+  }
+
+  if (!m_doc.hasMesh()) {
+    m_visible.clear();
+    m_stageSelection.clear();
+    m_selection.clear();
+    m_selectionStage = -1;
+    m_view->clear();
+    refreshAll();
+    log(QStringLiteral("Deleted all %1 pipeline stage(s).").arg(removed));
+    return;
+  }
+
+  const bool activeRemoved = oldActive >= 0 && !mapping.contains(oldActive);
+  if (activeRemoved || m_visible.isEmpty())
+    m_visible.insert(m_doc.activeIndex());
+
+  refreshAll();
+  // showDocument rebuilt actors against the new indices; re-apply the
+  // remapped face-selection highlight.
+  m_view->setSelection(m_selectionStage, m_selection);
+  log(QStringLiteral("Deleted %1 pipeline stage(s), including downstream "
+                     "dependants.")
+          .arg(removed));
 }
 
 void MainWindow::saveActiveMesh() {
@@ -547,22 +972,111 @@ void MainWindow::saveActiveMesh() {
   if (path.isEmpty())
     return;
   QString error;
-  if (!saveMesh(path, m_doc.activeMesh(), error))
+  if (!saveActiveMeshTo(path, error))
     QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
-  else
-    log(QStringLiteral("Saved stage %1 to %2.").arg(m_doc.activeIndex()).arg(path));
+}
+
+bool MainWindow::saveActiveMeshTo(const QString& path, QString& error) {
+  error.clear();
+  if (!ensureActiveMesh(error))
+    return false;
+  if (path.isEmpty()) {
+    error = QStringLiteral("No output path given.");
+    return false;
+  }
+  if (!saveMesh(path, m_doc.activeMesh(), error))
+    return false;
+  log(QStringLiteral("Saved stage %1 to %2.").arg(m_doc.activeIndex()).arg(path));
+  return true;
+}
+
+void MainWindow::saveActiveFeatureEdges() {
+  if (!m_doc.hasMesh()) {
+    QMessageBox::information(this, QStringLiteral("MeshBench"),
+                             QStringLiteral("Extract or import feature edges first."));
+    return;
+  }
+  if (m_doc.node(m_doc.activeIndex()).featureEdges.empty()) {
+    QMessageBox::information(
+        this, QStringLiteral("MeshBench"),
+        QStringLiteral("The active stage has no feature edges. Run "
+                       "Operations > Extract feature edges first."));
+    return;
+  }
+  QString path = QFileDialog::getSaveFileName(
+      this, QStringLiteral("Export feature edges as eMesh"), {},
+      QStringLiteral("OpenFOAM eMesh (*.eMesh);;All files (*)"));
+  if (path.isEmpty())
+    return;
+  QString error;
+  if (!saveActiveFeatureEdgesTo(path, error))
+    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
+}
+
+bool MainWindow::saveActiveFeatureEdgesTo(const QString& pathIn,
+                                          QString& error) {
+  error.clear();
+  if (!m_doc.hasMesh()) {
+    error = QStringLiteral("Extract or import feature edges first.");
+    return false;
+  }
+  const auto& node = m_doc.node(m_doc.activeIndex());
+  if (node.featureEdges.empty()) {
+    error = QStringLiteral("The active stage has no feature edges. Run "
+                           "Operations > Extract feature edges first.");
+    return false;
+  }
+  if (pathIn.isEmpty()) {
+    error = QStringLiteral("No output path given.");
+    return false;
+  }
+  QString path = pathIn;
+  if (QFileInfo(path).suffix().isEmpty())
+    path += QStringLiteral(".eMesh");
+  if (!writeFeatureEdgeMesh(path, node.featureEdges, error))
+    return false;
+  log(QStringLiteral("Wrote %1 feature edges to %2.")
+          .arg(node.featureEdges.edges.size())
+          .arg(path));
+  return true;
+}
+
+void MainWindow::exportSceneImage() {
+  QString path = QFileDialog::getSaveFileName(
+      this, QStringLiteral("Export scene image"), {},
+      QStringLiteral("PNG image (*.png);;All files (*)"));
+  if (path.isEmpty())
+    return;
+  if (QFileInfo(path).suffix().isEmpty())
+    path += QStringLiteral(".png");
+  QString error;
+  if (!saveSceneImageTo(path, 0, 0, error)) {
+    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
+    return;
+  }
+  log(QStringLiteral("Exported scene image to %1.").arg(path));
+}
+
+bool MainWindow::saveSceneImageTo(const QString& path, int width, int height,
+                                  QString& error) {
+  error.clear();
+  if (path.isEmpty()) {
+    error = QStringLiteral("No output path given.");
+    return false;
+  }
+  return m_view->saveSceneImage(path, width, height, error);
 }
 
 void MainWindow::clearAll() {
+  cancelSelectionSession();
   m_doc.clear();
   m_visible.clear();
   m_stageSelection.clear();
   m_view->clear();
-  if (m_selectBtn && m_selectBtn->isChecked())
-    m_selectBtn->setChecked(false);
   m_selectMode = false;
   m_selectionStage = -1;
   m_selection.clear();
+  m_selectedEdges.clear();
   rebuildTree();
   updateStagePanel();
   updateSelectPanel();
@@ -627,12 +1141,6 @@ void MainWindow::runBoolean() {
       QStringLiteral("Meshes (*.stl *.off *.obj);;All files (*)"));
   if (path.isEmpty())
     return;
-  Mesh other;
-  QString error;
-  if (!loadMesh(path, other, error)) {
-    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
-    return;
-  }
   QDialog dlg(this);
   dlg.setWindowTitle(QStringLiteral("Boolean operation"));
   auto* layout = new QVBoxLayout(&dlg);
@@ -648,36 +1156,66 @@ void MainWindow::runBoolean() {
   if (dlg.exec() != QDialog::Accepted)
     return;
   const auto op = static_cast<BooleanOp>(combo->currentIndex());
-  Mesh out;
-  if (!booleanOp(m_doc.activeMesh(), other, op, out, error)) {
+  QString error;
+  if (!applyBoolean(path, op, error))
     QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
-    return;
+}
+
+bool MainWindow::applyBoolean(const QString& path, BooleanOp op,
+                              QString& error) {
+  error.clear();
+  if (!ensureActiveMesh(error))
+    return false;
+  if (path.isEmpty()) {
+    error = QStringLiteral("No second mesh path given.");
+    return false;
   }
+  Mesh other;
+  if (!loadMesh(path, other, error))
+    return false;
+  Mesh out;
+  if (!booleanOp(m_doc.activeMesh(), other, op, out, error))
+    return false;
   static const char* names[] = {"Union", "Intersection", "Difference"};
+  const int index = static_cast<int>(op);
+  if (index < 0 || index > 2) {
+    error = QStringLiteral("Invalid boolean operation.");
+    return false;
+  }
   const MeshStats s = computeStats(out);
-  m_doc.appendOperation(QString::fromUtf8(names[combo->currentIndex()]),
+  m_doc.appendOperation(QString::fromUtf8(names[index]),
                         QStringLiteral("with %1").arg(QFileInfo(path).fileName()),
                         std::move(out));
   m_visible.insert(m_doc.activeIndex());
+  refreshView();
   log(QStringLiteral("Boolean %1: %2 faces, volume %3.")
-          .arg(QString::fromUtf8(names[combo->currentIndex()]))
+          .arg(QString::fromUtf8(names[index]))
           .arg(s.faces)
           .arg(s.volume));
+  return true;
 }
 
 void MainWindow::runCenter() {
   if (!requireMesh())
     return;
-  Mesh out = m_doc.activeMesh();
   QString error;
-  if (!centerAtVolumeCentroid(out, error)) {
+  if (!applyCenter(error))
     QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
-    return;
-  }
+}
+
+bool MainWindow::applyCenter(QString& error) {
+  error.clear();
+  if (!ensureActiveMesh(error))
+    return false;
+  Mesh out = m_doc.activeMesh();
+  if (!centerAtVolumeCentroid(out, error))
+    return false;
   m_doc.appendOperation(QStringLiteral("Center"), QStringLiteral("at volume center"),
                         std::move(out));
   m_visible.insert(m_doc.activeIndex());
+  refreshView();
   log(QStringLiteral("Centered geometry at center of volume."));
+  return true;
 }
 
 void MainWindow::runTransform() {
@@ -704,18 +1242,23 @@ void MainWindow::runTransform() {
   params.rotateDeg[1] = d[QStringLiteral("Rotate Y (deg)")];
   params.rotateDeg[2] = d[QStringLiteral("Rotate Z (deg)")];
   params.rotateAboutCenter = bv.value(QStringLiteral("Rotate about mesh center"), true);
+  QString error;
+  if (!applyTransform(params, error))
+    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
+}
+
+bool MainWindow::applyTransform(const TransformParams& params, QString& error) {
+  error.clear();
+  if (!ensureActiveMesh(error))
+    return false;
   const std::size_t inFaces = m_doc.activeMesh().num_faces();
   Mesh out = m_doc.activeMesh();
-  QString error;
-  if (!transformMesh(out, params, error)) {
-    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
-    return;
-  }
+  if (!transformMesh(out, params, error))
+    return false;
   // Exit check: the filter must return the same topology it consumed.
   if (out.num_vertices() == 0 || out.num_faces() != inFaces) {
-    QMessageBox::warning(this, QStringLiteral("MeshBench"),
-                         QStringLiteral("Transform produced an invalid mesh."));
-    return;
+    error = QStringLiteral("Transform produced an invalid mesh.");
+    return false;
   }
   const auto fmt = [](double v) { return QString::number(v, 'g', 6); };
   const QString pivot = params.rotateAboutCenter ? QStringLiteral("center")
@@ -727,7 +1270,9 @@ void MainWindow::runTransform() {
                fmt(params.rotateDeg[1]), fmt(params.rotateDeg[2]), pivot);
   m_doc.appendOperation(QStringLiteral("Transform"), details, std::move(out));
   m_visible.insert(m_doc.activeIndex());
+  refreshView();
   log(QStringLiteral("Transformed stage: %1.").arg(details));
+  return true;
 }
 
 void MainWindow::runAlphaWrap() {
@@ -740,6 +1285,17 @@ void MainWindow::runAlphaWrap() {
                     {"Offset denominator (bbox diag / offset)", 1000.0}},
                    {}, d, i))
     return;
+  QString error;
+  if (!applyAlphaWrap(d["Alpha denominator (bbox diag / alpha)"],
+                      d["Offset denominator (bbox diag / offset)"], error))
+    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
+}
+
+bool MainWindow::applyAlphaWrap(double alphaDenominator,
+                                double offsetDenominator, QString& error) {
+  error.clear();
+  if (!ensureActiveMesh(error))
+    return false;
   // Docs-page style relative parameters: scale by the active mesh bbox.
   const MeshStats inStats = computeStats(m_doc.activeMesh());
   const double dx = inStats.bboxMax[0] - inStats.bboxMin[0];
@@ -747,31 +1303,331 @@ void MainWindow::runAlphaWrap() {
   const double dz = inStats.bboxMax[2] - inStats.bboxMin[2];
   const double diag = std::sqrt(dx * dx + dy * dy + dz * dz);
   double alpha = 0.0, offset = 0.0;
-  QString error;
-  if (!alphaWrapParams(diag, d["Alpha denominator (bbox diag / alpha)"],
-                       d["Offset denominator (bbox diag / offset)"], alpha,
-                       offset, error)) {
-    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
-    return;
-  }
+  if (!alphaWrapParams(diag, alphaDenominator, offsetDenominator, alpha, offset,
+                       error))
+    return false;
   Mesh out;
-  if (!alphaWrap(m_doc.activeMesh(), alpha, offset, out, error)) {
-    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
-    return;
-  }
+  if (!alphaWrap(m_doc.activeMesh(), alpha, offset, out, error))
+    return false;
   const MeshStats s = computeStats(out);
   m_doc.appendOperation(
       QStringLiteral("AlphaWrap"),
       QStringLiteral("alpha=diag/%1 (%2) offset=diag/%3 (%4)")
-          .arg(d["Alpha denominator (bbox diag / alpha)"])
+          .arg(alphaDenominator)
           .arg(alpha)
-          .arg(d["Offset denominator (bbox diag / offset)"])
+          .arg(offsetDenominator)
           .arg(offset),
       std::move(out));
   m_visible.insert(m_doc.activeIndex());
+  refreshView();
   log(QStringLiteral("Alpha wrap: %1 faces, closed=%2.")
           .arg(s.faces)
           .arg(s.closed ? QStringLiteral("yes") : QStringLiteral("no")));
+  return true;
+}
+
+void MainWindow::runIsotropicRemesh() {
+  if (!requireMesh())
+    return;
+  const MeshStats inStats = computeStats(m_doc.activeMesh());
+  const double dx = inStats.bboxMax[0] - inStats.bboxMin[0];
+  const double dy = inStats.bboxMax[1] - inStats.bboxMin[1];
+  const double dz = inStats.bboxMax[2] - inStats.bboxMin[2];
+  const double diag = std::sqrt(dx * dx + dy * dy + dz * dz);
+  const double defaultSize = diag > 0.0 ? diag / 50.0 : 0.1;
+  QMap<QString, double> d;
+  QMap<QString, int> iv;
+  if (!paramDialog(this, QStringLiteral("CGAL isotropic remesh"),
+                   {{QStringLiteral("Target edge length"), defaultSize},
+                    {QStringLiteral("Feature angle (deg)"), 30.0}},
+                   {{QStringLiteral("Iterations"), 3}}, d, iv))
+    return;
+  QString error;
+  if (!applyIsotropicRemesh(d[QStringLiteral("Target edge length")],
+                            iv[QStringLiteral("Iterations")],
+                            d[QStringLiteral("Feature angle (deg)")], error))
+    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
+}
+
+bool MainWindow::applyIsotropicRemesh(double targetEdgeLength, int iterations,
+                                      double featureAngleDeg,
+                                      QString& error) {
+  error.clear();
+  if (!ensureActiveMesh(error))
+    return false;
+  const MeshStats inStats = computeStats(m_doc.activeMesh());
+  Mesh out;
+  if (!isotropicRemesh(m_doc.activeMesh(), targetEdgeLength, iterations,
+                       featureAngleDeg, out, error))
+    return false;
+  const auto fmt = [](double v) { return QString::number(v, 'g', 6); };
+  const MeshStats s = computeStats(out);
+  m_doc.appendOperation(
+      QStringLiteral("IsotropicRemesh"),
+      QStringLiteral("edge=%1 iters=%2 feature=%3 deg")
+          .arg(fmt(targetEdgeLength))
+          .arg(iterations)
+          .arg(fmt(featureAngleDeg)),
+      std::move(out));
+  m_visible.insert(m_doc.activeIndex());
+  refreshView();
+  log(QStringLiteral("Isotropic remesh: %1 -> %2 faces, closed=%3.")
+          .arg(inStats.faces)
+          .arg(s.faces)
+          .arg(s.closed ? QStringLiteral("yes") : QStringLiteral("no")));
+  return true;
+}
+
+void MainWindow::runExtractFeatureEdges() {
+  if (!requireMesh())
+    return;
+  QMap<QString, double> d;
+  QMap<QString, int> iv;
+  QMap<QString, bool> bv;
+  if (!paramDialog(this, QStringLiteral("Extract feature edges"),
+                   {{QStringLiteral("Feature angle (deg)"), 30.0}}, {}, d, iv,
+                   {{QStringLiteral("Include open boundary edges"), true}},
+                   &bv))
+    return;
+  QString error;
+  if (!applyExtractFeatureEdges(
+          d[QStringLiteral("Feature angle (deg)")],
+          bv.value(QStringLiteral("Include open boundary edges"), true), error))
+    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
+}
+
+bool MainWindow::applyExtractFeatureEdges(double featureAngleDeg,
+                                          bool includeBoundary,
+                                          QString& error) {
+  error.clear();
+  if (!ensureActiveMesh(error))
+    return false;
+  FeatureEdges edges;
+  if (!extractFeatureEdges(m_doc.activeMesh(), featureAngleDeg, includeBoundary,
+                           edges, error))
+    return false;
+  if (edges.empty()) {
+    error = QStringLiteral("No feature edges found at this angle. Try a "
+                           "smaller feature angle or include boundary edges.");
+    return false;
+  }
+  const int edgeCount = static_cast<int>(edges.edges.size());
+  const int source = m_doc.activeIndex();
+  Mesh base = m_doc.activeMesh();
+  m_doc.appendOperation(
+      QStringLiteral("FeatureEdges"),
+      QStringLiteral("%1 edges, angle=%2 deg, boundary=%3")
+          .arg(edgeCount)
+          .arg(featureAngleDeg)
+          .arg(includeBoundary ? QStringLiteral("yes") : QStringLiteral("no")),
+      std::move(base), std::move(edges));
+  m_visible.remove(source);
+  m_visible.insert(m_doc.activeIndex());
+  refreshView();
+  log(QStringLiteral("Extracted %1 feature edges (%2 points).")
+          .arg(edgeCount)
+          .arg(m_doc.node(m_doc.activeIndex()).featureEdges.points.size()));
+  return true;
+}
+
+void MainWindow::runSnapToFeatureEdges() {
+  if (!requireMesh())
+    return;
+  const int active = m_doc.activeIndex();
+  QList<int> candidates;
+  for (int i = 0; i < m_doc.nodeCount(); ++i) {
+    if (!m_doc.node(i).featureEdges.empty())
+      candidates.append(i);
+  }
+  if (candidates.isEmpty()) {
+    QMessageBox::information(
+        this, QStringLiteral("MeshBench"),
+        QStringLiteral("No feature edge set is available. Extract feature "
+                       "edges or import an eMesh first, then apply this "
+                       "filter to the target stage."));
+    return;
+  }
+
+  QDialog dlg(this);
+  dlg.setWindowTitle(QStringLiteral("Snap to feature edges"));
+  auto* layout = new QVBoxLayout(&dlg);
+  auto* form = new QFormLayout();
+  layout->addLayout(form);
+  auto* combo = new QComboBox(&dlg);
+  int preferred = 0;
+  for (int k = 0; k < candidates.size(); ++k) {
+    const int i = candidates[k];
+    const auto& node = m_doc.node(i);
+    combo->addItem(QStringLiteral("%1: %2 (%3 edges)")
+                       .arg(i)
+                       .arg(node.label)
+                       .arg(node.featureEdges.edges.size()),
+                   i);
+    // Prefer the closest earlier feature-edge stage, which is normally the
+    // one extracted from the original surface before alpha wrapping etc.
+    if (i < active)
+      preferred = k;
+  }
+  combo->setCurrentIndex(preferred);
+  form->addRow(QStringLiteral("Feature edge set"), combo);
+
+  const MeshStats stats = computeStats(m_doc.activeMesh());
+  const double dx = stats.bboxMax[0] - stats.bboxMin[0];
+  const double dy = stats.bboxMax[1] - stats.bboxMin[1];
+  const double dz = stats.bboxMax[2] - stats.bboxMin[2];
+  const double diag = std::sqrt(dx * dx + dy * dy + dz * dz);
+  auto* sizeSpin = new QDoubleSpinBox(&dlg);
+  sizeSpin->setRange(1e-6, 1e9);
+  sizeSpin->setDecimals(6);
+  sizeSpin->setValue(diag > 0.0 ? diag / 50.0 : 0.1);
+  form->addRow(QStringLiteral("Target edge length"), sizeSpin);
+  auto* angleSpin = new QDoubleSpinBox(&dlg);
+  angleSpin->setRange(0.0, 30.0);
+  angleSpin->setDecimals(1);
+  angleSpin->setValue(20.0);
+  angleSpin->setToolTip(QStringLiteral("Minimum facet angle. Higher values "
+                                       "reduce sliver triangles but increase "
+                                       "the triangle count."));
+  form->addRow(QStringLiteral("Min facet angle (deg)"), angleSpin);
+
+  auto* buttons =
+      new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel,
+                           &dlg);
+  layout->addWidget(buttons);
+  connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+  connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+  if (dlg.exec() != QDialog::Accepted)
+    return;
+
+  const int source = combo->currentData().toInt();
+  QString error;
+  if (!applySnapToFeatureEdges(source, sizeSpin->value(), angleSpin->value(),
+                               error))
+    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
+}
+
+bool MainWindow::applySnapToFeatureEdges(int sourceStage,
+                                         double targetEdgeLength,
+                                         double minFacetAngleDeg,
+                                         QString& error) {
+  error.clear();
+  if (!ensureActiveMesh(error))
+    return false;
+
+  // Resolve the feature-edge stage: explicit index, else the nearest earlier
+  // stage carrying edges (normally the set extracted before alpha wrapping).
+  QList<int> candidates;
+  for (int i = 0; i < m_doc.nodeCount(); ++i) {
+    if (!m_doc.node(i).featureEdges.empty())
+      candidates.append(i);
+  }
+  if (candidates.isEmpty()) {
+    error = QStringLiteral("No feature edge set is available. Extract feature "
+                           "edges or import an eMesh first.");
+    return false;
+  }
+  int source = sourceStage;
+  if (source < 0 || source >= m_doc.nodeCount() ||
+      m_doc.node(source).featureEdges.empty()) {
+    source = candidates.front();
+    for (int i : candidates) {
+      if (i < m_doc.activeIndex())
+        source = i;
+    }
+  }
+  if (m_doc.node(source).featureEdges.empty()) {
+    error = QStringLiteral("Stage %1 has no feature edges.").arg(sourceStage);
+    return false;
+  }
+  // Copy the edge set before appending: a filter on an older active stage
+  // truncates the redo tail (which can include the edge-set stage).
+  const FeatureEdges edgeSet = m_doc.node(source).featureEdges;
+  Mesh out;
+  if (!snapToFeatureEdges(m_doc.activeMesh(), edgeSet, targetEdgeLength,
+                          minFacetAngleDeg, out, error))
+    return false;
+  const auto fmt = [](double v) { return QString::number(v, 'g', 6); };
+  const MeshStats s = computeStats(out);
+  m_doc.appendOperation(
+      QStringLiteral("SnapToFeatureEdges"),
+      QStringLiteral("from stage %1 (%2 edges), edge=%3, angle=%4 deg")
+          .arg(source)
+          .arg(edgeSet.edges.size())
+          .arg(fmt(targetEdgeLength))
+          .arg(fmt(minFacetAngleDeg)),
+      std::move(out));
+  m_visible.insert(m_doc.activeIndex());
+  refreshView();
+  log(QStringLiteral("Snapped to %1 feature edges from stage %2: %3 faces.")
+          .arg(edgeSet.edges.size())
+          .arg(source)
+          .arg(s.faces));
+  return true;
+}
+
+void MainWindow::runAutoClean() {
+  if (!requireMesh())
+    return;
+  QMap<QString, double> d;
+  QMap<QString, int> iv;
+  if (!paramDialog(
+          this, QStringLiteral("Autoclean (experimental)"),
+          {{QStringLiteral("Small triangle ratio (0-1)"), 0.35},
+           {QStringLiteral("Max region size (% bbox diag)"), 5.0}},
+          {{QStringLiteral("Min small faces"), 8},
+           {QStringLiteral("Grow rings"), 1},
+           {QStringLiteral("Max hole edges"), 256}},
+          d, iv))
+    return;
+
+  AutoCleanParams params;
+  params.detailSizeRatio = d[QStringLiteral("Small triangle ratio (0-1)")];
+  params.maxRegionFraction =
+      d[QStringLiteral("Max region size (% bbox diag)")] / 100.0;
+  params.minSmallFaces = iv[QStringLiteral("Min small faces")];
+  params.growRings = iv[QStringLiteral("Grow rings")];
+  params.maxHoleEdges = iv[QStringLiteral("Max hole edges")];
+
+  AutoCleanResult result;
+  QString error;
+  if (!applyAutoClean(params, result, error))
+    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
+}
+
+bool MainWindow::applyAutoClean(const AutoCleanParams& params,
+                                AutoCleanResult& result, QString& error) {
+  error.clear();
+  result = {};
+  if (!ensureActiveMesh(error))
+    return false;
+  Mesh out = m_doc.activeMesh();
+  if (!autoCleanMesh(out, params, result, error))
+    return false;
+  for (const auto& warning : result.warnings)
+    log(QStringLiteral("Autoclean warning: %1").arg(warning));
+  if (result.clustersRemoved == 0 || result.facesRemoved == 0) {
+    error = QStringLiteral("No small complex clusters matched the current "
+                           "parameters. Try a larger small-triangle ratio or "
+                           "region size.");
+    return false;
+  }
+
+  const QString details =
+      QStringLiteral("%1 clusters, %2 faces removed, %3 holes patched")
+          .arg(result.clustersRemoved)
+          .arg(result.facesRemoved)
+          .arg(result.holesPatched);
+  m_doc.appendOperation(QStringLiteral("Autoclean (experimental)"), details,
+                        std::move(out));
+  m_visible.insert(m_doc.activeIndex());
+  refreshView();
+  log(QStringLiteral("Autoclean: %1 cluster(s), %2 face(s) removed, %3 hole(s) "
+                     "patched smoothly, %4 hole(s) skipped.")
+          .arg(result.clustersRemoved)
+          .arg(result.facesRemoved)
+          .arg(result.holesPatched)
+          .arg(result.holesSkipped));
+  return true;
 }
 
 void MainWindow::runClip() {
@@ -792,30 +1648,59 @@ void MainWindow::runClip() {
                     {"Normal z", 1.0}},
                    {}, d, i))
     return;
-  Mesh out;
   QString error;
-  if (!clipWithPlane(m_doc.activeMesh(),
-                     makePoint(d["Origin x"], d["Origin y"], d["Origin z"]),
-                     Vector3(d["Normal x"], d["Normal y"], d["Normal z"]), out,
-                     error)) {
+  if (!applyClip(makePoint(d["Origin x"], d["Origin y"], d["Origin z"]),
+                 Vector3(d["Normal x"], d["Normal y"], d["Normal z"]), error))
     QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
-    return;
-  }
+}
+
+bool MainWindow::applyClip(const Point3& origin, const Vector3& normal,
+                           QString& error) {
+  error.clear();
+  if (!ensureActiveMesh(error))
+    return false;
+  Mesh out;
+  if (!clipWithPlane(m_doc.activeMesh(), origin, normal, out, error))
+    return false;
+  const MeshStats sliced = computeStats(out);
   m_doc.appendOperation(
       QStringLiteral("Slice"),
-      QStringLiteral("n=(%1,%2,%3)").arg(d["Normal x"]).arg(d["Normal y"]).arg(d["Normal z"]),
+      QStringLiteral("n=(%1,%2,%3)")
+          .arg(toDouble(normal.x()))
+          .arg(toDouble(normal.y()))
+          .arg(toDouble(normal.z())),
       std::move(out));
   m_visible.insert(m_doc.activeIndex());
-  log(QStringLiteral("Sliced with plane; %1 faces remain.").arg(computeStats(out).faces));
+  refreshView();
+  log(QStringLiteral("Sliced with plane; %1 faces remain.").arg(sliced.faces));
+  return true;
 }
 
 void MainWindow::runDetectLeaks() {
   if (!requireMesh())
     return;
-  probeMeshAndAppend(m_doc.activeMesh(), QStringLiteral("LeakProbe"));
+  QMap<QString, double> d;
+  QMap<QString, int> iv;
+  if (!paramDialog(this, QStringLiteral("Leak detection grid"), {},
+                   {{"Voxels per axis", ProbeParams{}.gridRes}}, d, iv))
+    return;
+  QString error;
+  if (!probeMeshAndAppend(m_doc.activeMesh(), QStringLiteral("LeakProbe"),
+                          iv["Voxels per axis"], error))
+    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
 }
 
-void MainWindow::probeMeshAndAppend(const Mesh& mesh, const QString& stageLabel) {
+bool MainWindow::probeMeshAndAppend(const Mesh& mesh, const QString& stageLabel,
+                                    int gridRes, QString& error) {
+  error.clear();
+  if (mesh.num_vertices() == 0) {
+    error = QStringLiteral("Cannot probe an empty mesh.");
+    return false;
+  }
+  if (gridRes < 2) {
+    error = QStringLiteral("Voxels per axis must be at least 2.");
+    return false;
+  }
   const auto probes = probesFromTable();
   m_doc.setProbes(probes);
   std::vector<std::array<double, 3>> inPts, outPts;
@@ -825,13 +1710,8 @@ void MainWindow::probeMeshAndAppend(const Mesh& mesh, const QString& stageLabel)
     else
       outPts.push_back({pr.x, pr.y, pr.z});
   }
-  QMap<QString, double> d;
-  QMap<QString, int> iv;
-  if (!paramDialog(this, QStringLiteral("Leak detection grid"), {},
-                   {{"Voxels per axis", ProbeParams{}.gridRes}}, d, iv))
-    return;
   ProbeParams probeParams;
-  probeParams.gridRes = iv["Voxels per axis"];
+  probeParams.gridRes = gridRes;
   const auto res = detectLeaks(mesh, inPts, outPts, probeParams);
   const auto loops = findHoleLoops(mesh);
   LeakReport report;
@@ -868,6 +1748,7 @@ void MainWindow::probeMeshAndAppend(const Mesh& mesh, const QString& stageLabel)
   m_doc.setLeakReport(report);
   m_visible.remove(leakSource);
   m_visible.insert(m_doc.activeIndex());
+  refreshView();
   for (const auto& w : res.warnings)
     log(QStringLiteral("Probe warning: %1").arg(w));
   log(QStringLiteral("Leak probe: %1 cells (%2 faces blocked), %3 regions, "
@@ -882,6 +1763,12 @@ void MainWindow::probeMeshAndAppend(const Mesh& mesh, const QString& stageLabel)
                                    "hole loops.")
                   : QStringLiteral("No leak: inside and outside points are "
                                    "separated."));
+  // Exit check: the probe report must be attached to the new active stage.
+  if (!m_doc.hasMesh() || !m_doc.node(m_doc.activeIndex()).leaks.probed) {
+    error = QStringLiteral("Leak probe did not attach a report to the stage.");
+    return false;
+  }
+  return true;
 }
 
 void MainWindow::runPatchHoles() {
@@ -896,6 +1783,22 @@ void MainWindow::runPatchHoles() {
                    &bv))
     return;
   const bool patchAll = bv.value(QStringLiteral("Patch every boundary loop (ignore leak paths)"), false);
+  QString error;
+  if (!applyPatchHoles(iv["Max loop edges"], patchAll, error))
+    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
+}
+
+bool MainWindow::applyPatchHoles(int maxLoopEdges, bool patchAll,
+                                 QString& error, int* loopsFilled) {
+  error.clear();
+  if (loopsFilled)
+    *loopsFilled = 0;
+  if (!ensureActiveMesh(error))
+    return false;
+  if (maxLoopEdges < 3) {
+    error = QStringLiteral("Max loop edges must be at least 3.");
+    return false;
+  }
   // Default: only patch holes that leak paths actually traverse. That
   // needs probes, so re-probe silently here.
   QSet<int> leakingLoops;
@@ -904,11 +1807,9 @@ void MainWindow::runPatchHoles() {
   if (!patchAll) {
     const auto probes = probesFromTable();
     if (probes.isEmpty()) {
-      QMessageBox::information(
-          this, QStringLiteral("MeshBench"),
-          QStringLiteral("Path-driven patching needs inside/outside probes. "
-                         "Add probes, or tick 'Patch every boundary loop'."));
-      return;
+      error = QStringLiteral("Path-driven patching needs inside/outside "
+                             "probes. Add probes, or set patch_all=true.");
+      return false;
     }
     std::vector<std::array<double, 3>> inPts, outPts;
     for (const auto& pr : probes) {
@@ -923,7 +1824,7 @@ void MainWindow::runPatchHoles() {
       log(QStringLiteral("Probe warning: %1").arg(w));
     if (!res.hasLeak) {
       log(QStringLiteral("Patch holes: no leak found, nothing to patch."));
-      return;
+      return true; // valid no-op result
     }
     // Bridge analysis (complete: every hole on some inside->outside route)
     // instead of sampling whichever holes routes happened to cross.
@@ -936,12 +1837,14 @@ void MainWindow::runPatchHoles() {
             .arg(res.loops.size()));
     if (leakingLoops.isEmpty()) {
       log(QStringLiteral("Patch holes: no hole loop bridges inside to outside; "
-                         "tick 'Patch every boundary loop' to patch anyway."));
-      return;
+                         "set patch_all=true to patch anyway."));
+      return true; // valid no-op result
     }
   }
   Mesh out = m_doc.activeMesh();
-  const PatchResult r = patchHoles(out, iv["Max loop edges"], leakingLoops);
+  const PatchResult r = patchHoles(out, maxLoopEdges, leakingLoops);
+  if (loopsFilled)
+    *loopsFilled = r.loopsFilled;
   for (const auto& w : r.warnings)
     log(QStringLiteral("Patch warning: %1").arg(w));
   log(QStringLiteral("Patch holes: %1 loops found, %2 filled (%3 faces), %4 "
@@ -960,6 +1863,7 @@ void MainWindow::runPatchHoles() {
         QStringLiteral("%1 loops filled").arg(r.loopsFilled), std::move(out));
     m_visible.remove(patchSource);
     m_visible.insert(m_doc.activeIndex());
+    refreshView();
     if (!patchAll) {
       // Keep the routes/grid this patching was based on (silent re-probe
       // above) on the new stage so the view toggles can display them even
@@ -988,10 +1892,19 @@ void MainWindow::runPatchHoles() {
                 .arg(routes.leakPaths.size() + routes.walkPaths.size()));
     }
   }
+  // Exit check: a successful patch call either appended a stage or was a
+  // reported no-op (handled above).
+  if (r.loopsFilled > 0) {
+    const auto& node = m_doc.node(m_doc.activeIndex());
+    if (node.label != QStringLiteral("PatchHoles")) {
+      error = QStringLiteral("Patch holes did not append the result stage.");
+      return false;
+    }
+  }
+  return true;
 }
 
 void MainWindow::runGmshRemesh() {
-#ifdef MESHBENCH_HAVE_GMSH
   if (!requireMesh())
     return;
   QMap<QString, double> d;
@@ -1000,25 +1913,29 @@ void MainWindow::runGmshRemesh() {
                    {{"Target element size", 0.1}}, {}, d, iv))
     return;
   QString error;
-  Mesh out;
-  if (!remeshMesh(m_doc.activeMesh(), d["Target element size"], out, error)) {
+  if (!applyGmshRemesh(d["Target element size"], error))
     QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
-    return;
-  }
+}
+
+bool MainWindow::applyGmshRemesh(double targetElementSize, QString& error) {
+  error.clear();
+  if (!ensureActiveMesh(error))
+    return false;
+  Mesh out;
+  if (!remeshMesh(m_doc.activeMesh(), targetElementSize, out, error))
+    return false;
+  const MeshStats remeshed = computeStats(out);
   m_doc.appendOperation(
       QStringLiteral("GmshRemesh"),
-      QStringLiteral("size=%1").arg(d["Target element size"]), std::move(out));
+      QStringLiteral("size=%1").arg(targetElementSize), std::move(out));
   m_visible.insert(m_doc.activeIndex());
-  log(QStringLiteral("Gmsh remesh done: %1 faces.").arg(computeStats(out).faces));
-#else
-  QMessageBox::information(this, QStringLiteral("MeshBench"),
-                           QStringLiteral("Gmsh support not compiled in."));
-#endif
+  refreshView();
+  log(QStringLiteral("Gmsh remesh done: %1 faces.").arg(remeshed.faces));
+  return true;
 }
 
 bool MainWindow::remeshMesh(const Mesh& in, double size, Mesh& out,
                             QString& error) {
-#ifdef MESHBENCH_HAVE_GMSH
   const QString tmpIn = QDir::temp().filePath(QStringLiteral("meshbench_in.stl"));
   const QString tmpOut = QDir::temp().filePath(QStringLiteral("meshbench_out.stl"));
   if (!saveMesh(tmpIn, in, error))
@@ -1026,14 +1943,9 @@ bool MainWindow::remeshMesh(const Mesh& in, double size, Mesh& out,
   if (!remeshStlWithGmsh(tmpIn, tmpOut, size, error))
     return false;
   return loadMesh(tmpOut, out, error);
-#else
-  error = QStringLiteral("Gmsh support not compiled in.");
-  return false;
-#endif
 }
 
 void MainWindow::runCreatePrimitive() {
-#ifdef MESHBENCH_HAVE_GMSH
   QDialog dlg(this);
   dlg.setWindowTitle(QStringLiteral("Create primitive shape (Gmsh)"));
   auto* layout = new QVBoxLayout(&dlg);
@@ -1094,17 +2006,32 @@ void MainWindow::runCreatePrimitive() {
     params.dims.append(spin->value());
   params.meshSize = sizeSpin->value();
 
+  QString error;
+  if (!applyCreatePrimitive(params, error))
+    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
+}
+
+bool MainWindow::applyCreatePrimitive(const PrimitiveParams& params,
+                                      QString& error) {
+  error.clear();
+  if (params.dims.isEmpty()) {
+    error = QStringLiteral("No primitive dimensions given.");
+    return false;
+  }
+  if (!(params.meshSize > 0.0) || !std::isfinite(params.meshSize)) {
+    error = QStringLiteral("Primitive mesh size must be positive.");
+    return false;
+  }
   const QString tmp =
       QDir::temp().filePath(QStringLiteral("meshbench_primitive.stl"));
-  QString error;
-  if (!createPrimitiveStl(params, tmp, error)) {
-    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
-    return;
-  }
+  if (!createPrimitiveStl(params, tmp, error))
+    return false;
   Mesh mesh;
-  if (!loadMesh(tmp, mesh, error)) {
-    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
-    return;
+  if (!loadMesh(tmp, mesh, error))
+    return false;
+  if (mesh.num_vertices() == 0) {
+    error = QStringLiteral("Primitive generation produced an empty mesh.");
+    return false;
   }
   QStringList dimStr;
   for (double v : params.dims)
@@ -1115,16 +2042,15 @@ void MainWindow::runCreatePrimitive() {
                               dimStr.join(QStringLiteral(","))),
                      std::move(mesh));
   m_visible.insert(m_doc.activeIndex());
+  refreshView();
   probesToTable({});
-  setDefaultProbes();
+  QString probeError;
+  fillDefaultProbes(probeError);
   log(QStringLiteral("Created %1 primitive: %2 faces, closed=%3.")
           .arg(primitiveShapeName(params.shape))
           .arg(s.faces)
           .arg(s.closed ? QStringLiteral("yes") : QStringLiteral("no")));
-#else
-  QMessageBox::information(this, QStringLiteral("MeshBench"),
-                           QStringLiteral("Gmsh support not compiled in."));
-#endif
+  return true;
 }
 
 void MainWindow::runIntroduceHoles() {
@@ -1135,29 +2061,42 @@ void MainWindow::runIntroduceHoles() {
   if (!paramDialog(this, QStringLiteral("Introduce random holes"),
                    {}, {{"Triangles to remove", 10}, {"Seed", 42}}, d, iv))
     return;
-  Mesh out = m_doc.activeMesh();
   QString error;
-  const int removed = removeRandomTriangles(out, iv["Triangles to remove"],
-                                            static_cast<unsigned>(iv["Seed"]),
-                                            error);
+  if (!applyIntroduceHoles(iv["Triangles to remove"],
+                           static_cast<unsigned>(iv["Seed"]), error))
+    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
+}
+
+bool MainWindow::applyIntroduceHoles(int triangles, unsigned seed,
+                                     QString& error) {
+  error.clear();
+  if (!ensureActiveMesh(error))
+    return false;
+  if (triangles <= 0) {
+    error = QStringLiteral("Triangles to remove must be positive.");
+    return false;
+  }
+  Mesh out = m_doc.activeMesh();
+  const int removed = removeRandomTriangles(out, triangles, seed, error);
   if (removed == 0) {
-    QMessageBox::warning(this, QStringLiteral("MeshBench"),
-                         error.isEmpty() ? QStringLiteral("Nothing removed.")
-                                         : error);
-    return;
+    if (error.isEmpty())
+      error = QStringLiteral("Nothing removed.");
+    return false;
   }
   const MeshStats s = computeStats(out);
   m_doc.appendOperation(QStringLiteral("Puncture"),
                         QStringLiteral("removed %1 tris (seed %2)")
                             .arg(removed)
-                            .arg(iv["Seed"]),
+                            .arg(seed),
                         std::move(out));
   m_visible.insert(m_doc.activeIndex());
+  refreshView();
   log(QStringLiteral("Removed %1 triangles; now %2 hole loop(s), %3 boundary "
                      "edges. Run Detect leaks to see them.")
           .arg(removed)
           .arg(findHoleLoops(m_doc.activeMesh()).size())
           .arg(s.boundaryEdges));
+  return true;
 }
 
 void MainWindow::runShrinkwrap() {
@@ -1179,13 +2118,37 @@ void MainWindow::runShrinkwrap() {
   m_shrinkParams.subdivisions = iv["Sphere subdivisions (0-6)"];
   m_shrinkParams.iterations = iv["Iterations"];
 
+  QString error;
+  if (!applyShrinkwrap(m_shrinkParams, error))
+    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
+}
+
+bool MainWindow::applyShrinkwrap(const ShrinkParams& params, QString& error) {
+  error.clear();
+  if (!ensureActiveMesh(error))
+    return false;
+  if (params.subdivisions < 0 || params.subdivisions > 6) {
+    error = QStringLiteral("Sphere subdivisions must be between 0 and 6.");
+    return false;
+  }
+  if (params.iterations <= 0) {
+    error = QStringLiteral("Shrinkwrap iterations must be positive.");
+    return false;
+  }
+  if (!(params.step > 0.0) || params.step > 1.0) {
+    error = QStringLiteral("Shrinkwrap step must be in (0, 1].");
+    return false;
+  }
+  if (params.smooth < 0.0 || params.smooth > 0.9) {
+    error = QStringLiteral("Shrinkwrap smoothing must be in [0, 0.9].");
+    return false;
+  }
+  m_shrinkParams = params;
+
   const int source = m_doc.activeIndex();
   Mesh sphere = makeEnclosingSphere(m_doc.activeMesh(), m_shrinkParams.subdivisions);
-  QString error;
-  if (!snapShrinkwrap(m_doc.activeMesh(), {}, sphere, m_shrinkParams, error)) {
-    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
-    return;
-  }
+  if (!snapShrinkwrap(m_doc.activeMesh(), {}, sphere, m_shrinkParams, error))
+    return false;
   m_wrapSource = source;
   m_faceWeights.clear();
   m_faceSelection.clear();
@@ -1202,6 +2165,7 @@ void MainWindow::runShrinkwrap() {
   // Keep the baseline visible: the wrap renders translucent over it.
   m_visible.insert(m_wrapSource);
   m_visible.insert(m_wrapStage);
+  refreshView();
   updateShrinkPanel();
   log(QStringLiteral("Shrinkwrap stage %1 from stage %2 (%3 faces). Enable "
                      "'Select panels', click target triangles, set a weight, "
@@ -1209,6 +2173,7 @@ void MainWindow::runShrinkwrap() {
           .arg(m_wrapStage)
           .arg(m_wrapSource)
           .arg(computeStats(m_doc.node(m_wrapStage).mesh).faces));
+  return true;
 }
 
 void MainWindow::rerunShrinkwrap() {
@@ -1259,10 +2224,32 @@ void MainWindow::toggleSelectMode(bool on) {
   m_selectMode = on;
   if (!on) {
     m_view->setSelectMode(false);
+    // Normal exits commit the pending deletions as a new stage. Internal
+    // shutdowns (tree rebuild, stage deletion) discard them instead.
+    if (!m_suppressSelectionCommit)
+      commitSelectionDeletions();
+    else {
+      m_selection.clear();
+      m_selectedEdges.clear();
+      m_view->setSelection(m_selectionStage, {});
+      m_view->setEdgeSelection(m_selectionStage, {});
+      m_selectionStage = -1;
+    }
     updateSelectPanel();
     return;
   }
-  if (!requireMesh()) {
+  const bool hasSurface =
+      m_doc.hasMesh() && m_doc.activeMesh().num_vertices() > 0;
+  const bool hasEdges =
+      m_doc.hasMesh() && m_doc.activeIndex() >= 0 &&
+      !m_doc.node(m_doc.activeIndex()).featureEdges.empty();
+  if (!hasSurface && !hasEdges) {
+    // Imported eMesh-only stages are still selectable: the user can delete
+    // their feature edges even though there is no surface to pick.
+    QMessageBox::information(this, QStringLiteral("MeshBench"),
+                             QStringLiteral("Open or activate a stage with a "
+                                            "surface mesh or feature edges "
+                                            "first."));
     m_selectBtn->setChecked(false);
     m_selectMode = false;
     return;
@@ -1271,16 +2258,20 @@ void MainWindow::toggleSelectMode(bool on) {
   if (m_pickBtn->isChecked())
     m_pickBtn->setChecked(false);
   if (m_selectionStage != m_doc.activeIndex()) {
-    // Faces belong to one stage; switching stages restarts the set.
+    // Faces/edges belong to one stage; switching stages restarts the set.
     m_selectionStage = m_doc.activeIndex();
     m_selection.clear();
+    m_selectedEdges.clear();
   }
   m_visible.insert(m_selectionStage);
   refreshView();
   m_view->setSelectMode(true, m_selectionStage);
   m_view->setSelection(m_selectionStage, m_selection);
+  m_view->setEdgeSelection(m_selectionStage, m_selectedEdges);
   log(QStringLiteral("Select mode on stage %1: click toggles a triangle, "
-                     "drag selects a rectangle (S toggles).")
+                     "click an amber feature edge to toggle that edge, drag "
+                     "selects a rectangle. Exit S to apply deletions as a "
+                     "new stage.")
           .arg(m_selectionStage));
   updateSelectPanel();
 }
@@ -1294,6 +2285,18 @@ void MainWindow::onFacesSelected(const QSet<int>& faces) {
   log(QStringLiteral("Rectangle added %1 triangles (%2 selected).")
           .arg(faces.size())
           .arg(m_selection.size()));
+  updateSelectPanel();
+}
+
+void MainWindow::onFeatureEdgesSelected(const QSet<int>& edges) {
+  if (!m_selectMode)
+    return;
+  for (int e : edges)
+    m_selectedEdges.insert(e);
+  m_view->setEdgeSelection(m_selectionStage, m_selectedEdges);
+  log(QStringLiteral("Rectangle added %1 feature edges (%2 selected).")
+          .arg(edges.size())
+          .arg(m_selectedEdges.size()));
   updateSelectPanel();
 }
 
@@ -1312,16 +2315,20 @@ void MainWindow::runExtractSelection() {
                              QStringLiteral("Selection holds no faces."));
     return;
   }
+  const int source = m_selectionStage;
   m_doc.appendOperation(
       QStringLiteral("Selection"),
-      QStringLiteral("%1 faces from stage %2").arg(faces).arg(m_selectionStage),
+      QStringLiteral("%1 faces from stage %2").arg(faces).arg(source),
       std::move(sub));
   m_visible.insert(m_doc.activeIndex());
+  // The filter consumed the selection: leaving selection mode must not also
+  // delete those faces from the source stage.
+  clearSelection();
+  refreshView();
   log(QStringLiteral("Extracted %1 selected faces as a new stage.").arg(faces));
 }
 
 void MainWindow::runRemeshSelection() {
-#ifdef MESHBENCH_HAVE_GMSH
   if (m_selection.isEmpty() || m_selectionStage < 0 ||
       m_selectionStage >= m_doc.nodeCount()) {
     QMessageBox::information(this, QStringLiteral("MeshBench"),
@@ -1341,17 +2348,16 @@ void MainWindow::runRemeshSelection() {
     QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
     return;
   }
+  const MeshStats remeshed = computeStats(out);
   m_doc.appendOperation(
       QStringLiteral("GmshRemesh (selection)"),
       QStringLiteral("size=%1, %2 faces in").arg(d["Target element size"]).arg(sub.num_faces()),
       std::move(out));
   m_visible.insert(m_doc.activeIndex());
+  clearSelection();
+  refreshView();
   log(QStringLiteral("Gmsh remesh of selection done: %1 faces.")
-          .arg(computeStats(out).faces));
-#else
-  QMessageBox::information(this, QStringLiteral("MeshBench"),
-                           QStringLiteral("Gmsh support not compiled in."));
-#endif
+          .arg(remeshed.faces));
 }
 
 void MainWindow::runDetectLeaksSelection() {
@@ -1369,13 +2375,132 @@ void MainWindow::runDetectLeaksSelection() {
                              QStringLiteral("Selection holds no faces."));
     return;
   }
-  probeMeshAndAppend(sub, QStringLiteral("LeakProbe (selection)"));
+  QMap<QString, double> d;
+  QMap<QString, int> iv;
+  if (!paramDialog(this, QStringLiteral("Leak detection grid"), {},
+                   {{"Voxels per axis", ProbeParams{}.gridRes}}, d, iv))
+    return;
+  QString error;
+  if (!probeMeshAndAppend(sub, QStringLiteral("LeakProbe (selection)"),
+                          iv["Voxels per axis"], error)) {
+    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
+    return;
+  }
+  // The probe consumed the selection: do not also delete it on exit.
+  clearSelection();
 }
 
 void MainWindow::clearSelection() {
   m_selection.clear();
+  m_selectedEdges.clear();
   m_view->setSelection(m_selectionStage, m_selection);
+  m_view->setEdgeSelection(m_selectionStage, m_selectedEdges);
   updateSelectPanel();
+}
+
+void MainWindow::cancelSelectionSession() {
+  m_suppressSelectionCommit = true;
+  if (m_selectBtn && m_selectBtn->isChecked()) {
+    m_selectBtn->setChecked(false);
+  } else {
+    m_selectMode = false;
+    m_view->setSelectMode(false);
+    m_selection.clear();
+    m_selectedEdges.clear();
+    m_view->setSelection(m_selectionStage, {});
+    m_view->setEdgeSelection(m_selectionStage, {});
+    m_selectionStage = -1;
+    updateSelectPanel();
+  }
+  m_suppressSelectionCommit = false;
+}
+
+bool MainWindow::commitSelectionDeletions() {
+  const int source = m_selectionStage;
+  const bool hasSelection =
+      !m_selection.isEmpty() || !m_selectedEdges.isEmpty();
+  const auto clearSession = [this] {
+    m_selection.clear();
+    m_selectedEdges.clear();
+    if (m_view) {
+      m_view->setSelection(m_selectionStage, {});
+      m_view->setEdgeSelection(m_selectionStage, {});
+    }
+    m_selectionStage = -1;
+  };
+  if (!hasSelection) {
+    clearSession();
+    return true;
+  }
+  if (source < 0 || source >= m_doc.nodeCount()) {
+    clearSession();
+    return false;
+  }
+
+  // Never mutate the active node: copy its data and append the deletions as
+  // a new pipeline stage.
+  const PipelineNode& src = m_doc.node(source);
+  Mesh mesh = src.mesh;
+  FeatureEdges edges = src.featureEdges;
+  int removedFaces = 0;
+  int removedEdges = 0;
+  QString error;
+  if (!m_selection.isEmpty()) {
+    Mesh withoutFaces;
+    if (!removeMeshFaces(src.mesh, m_selection, withoutFaces, removedFaces,
+                         error)) {
+      log(QStringLiteral("Delete selection failed: %1").arg(error));
+      clearSession();
+      return false;
+    }
+    mesh = std::move(withoutFaces);
+  }
+  if (!m_selectedEdges.isEmpty()) {
+    FeatureEdges withoutEdges;
+    if (!removeFeatureEdges(src.featureEdges, m_selectedEdges, withoutEdges,
+                            removedEdges, error)) {
+      log(QStringLiteral("Delete feature edges failed: %1").arg(error));
+      clearSession();
+      return false;
+    }
+    edges = std::move(withoutEdges);
+  }
+  if (removedFaces == 0 && removedEdges == 0) {
+    clearSession();
+    return true;
+  }
+
+  QStringList parts;
+  if (removedFaces > 0)
+    parts << QStringLiteral("%1 faces").arg(removedFaces);
+  if (removedEdges > 0)
+    parts << QStringLiteral("%1 feature edges").arg(removedEdges);
+  if (m_doc.activeIndex() != source)
+    m_doc.setActive(source);
+  // appendOperation inserts directly after the active stage, so update
+  // visibility before it emits historyChanged (which rebuilds the tree).
+  int newStage = source + 1;
+  m_visible.remove(source);
+  m_visible.insert(newStage);
+  m_doc.appendOperation(
+      QStringLiteral("DeleteSelection"),
+      QStringLiteral("removed %1 from stage %2")
+          .arg(parts.join(QStringLiteral(", ")))
+          .arg(source),
+      std::move(mesh), std::move(edges));
+  if (m_doc.activeIndex() != newStage) {
+    m_visible.remove(newStage);
+    newStage = m_doc.activeIndex();
+    m_visible.insert(newStage);
+  }
+  clearSession();
+  updateSelectPanel();
+  refreshView();
+  log(QStringLiteral("Deleted %1 from stage %2 as new stage %3.")
+          .arg(parts.join(QStringLiteral(", ")))
+          .arg(source)
+          .arg(newStage));
+  return true;
 }
 
 void MainWindow::updateSelectPanel() {
@@ -1384,26 +2509,25 @@ void MainWindow::updateSelectPanel() {
   QStringList parts;
   if (m_selectionStage >= 0)
     parts << QStringLiteral("Stage %1.").arg(m_selectionStage);
-  parts << (m_selection.isEmpty()
-                ? QStringLiteral("No triangles selected.")
-                : QStringLiteral("%1 triangles selected.")
-                      .arg(m_selection.size()));
+  parts << QStringLiteral("%1 triangles, %2 feature edges selected.")
+               .arg(m_selection.size())
+               .arg(m_selectedEdges.size());
   parts << QStringLiteral("Select mode %1.").arg(
       m_selectBtn && m_selectBtn->isChecked() ? QStringLiteral("ON")
                                              : QStringLiteral("off"));
+  parts << QStringLiteral("Exit selection mode to apply deletions as a new "
+                          "stage.");
   m_selectLabel->setText(parts.join(QStringLiteral(" ")));
 }
 
 void MainWindow::validateSelection() {
-  if (m_selectionStage >= m_doc.nodeCount()) {
-    // Selected stage was reverted away: drop the session.
-    if (m_selectBtn && m_selectBtn->isChecked())
-      m_selectBtn->setChecked(false);
-    else
-      m_view->setSelectMode(false);
-    m_selectMode = false;
+  if (m_selectionStage < 0 || m_selectionStage >= m_doc.nodeCount()) {
+    // Selected stage was reverted away: drop the session without deleting.
+    if (m_selectMode || (m_selectBtn && m_selectBtn->isChecked()))
+      cancelSelectionSession();
     m_selectionStage = -1;
     m_selection.clear();
+    m_selectedEdges.clear();
   }
   updateSelectPanel();
 }
@@ -1429,6 +2553,25 @@ void MainWindow::onFacePicked(int faceIdx) {
   // Show the clicked panel's current weight in the editors.
   m_weightSpin->setValue(m_faceWeights.value(faceIdx, 1.0));
   updateShrinkPanel();
+}
+
+void MainWindow::onFeatureEdgePicked(int edgeIdx) {
+  if (!m_selectMode || edgeIdx < 0)
+    return;
+  if (m_selectionStage < 0 || m_selectionStage >= m_doc.nodeCount())
+    return;
+  if (static_cast<std::size_t>(edgeIdx) >=
+      m_doc.node(m_selectionStage).featureEdges.edges.size())
+    return;
+  if (m_selectedEdges.contains(edgeIdx))
+    m_selectedEdges.remove(edgeIdx);
+  else
+    m_selectedEdges.insert(edgeIdx);
+  m_view->setEdgeSelection(m_selectionStage, m_selectedEdges);
+  log(QStringLiteral("Toggled feature edge %1 (%2 selected).")
+          .arg(edgeIdx)
+          .arg(m_selectedEdges.size()));
+  updateSelectPanel();
 }
 
 void MainWindow::applyWeightToSelection() {
@@ -1502,6 +2645,15 @@ void MainWindow::validateShrinkState() {
 void MainWindow::setDefaultProbes() {
   if (!requireMesh())
     return;
+  QString error;
+  if (!fillDefaultProbes(error))
+    QMessageBox::warning(this, QStringLiteral("MeshBench"), error);
+}
+
+bool MainWindow::fillDefaultProbes(QString& error) {
+  error.clear();
+  if (!ensureActiveMesh(error))
+    return false;
   const MeshStats s = computeStats(m_doc.activeMesh());
   const double cx = (s.bboxMin[0] + s.bboxMax[0]) / 2;
   const double cy = (s.bboxMin[1] + s.bboxMax[1]) / 2;
@@ -1513,6 +2665,12 @@ void MainWindow::setDefaultProbes() {
   probesToTable({{cx, cy, cz, true},
                  {s.bboxMax[0] + pad, s.bboxMax[1] + pad, s.bboxMax[2] + pad, false}});
   log(QStringLiteral("Default probes: inside = bbox center, outside = beyond bbox."));
+  // Exit check: the editor must now hold an inside and an outside probe.
+  if (probesFromTable().size() != 2) {
+    error = QStringLiteral("Failed to install default probes.");
+    return false;
+  }
+  return true;
 }
 
 void MainWindow::addProbeRow(bool inside) {
@@ -1596,6 +2754,9 @@ void MainWindow::onTreeItemChanged(QTreeWidgetItem* item, int column) {
 void MainWindow::onTreeItemActivated(QTreeWidgetItem* item, int /*column*/) {
   if (!item)
     return;
+  // Switching the active stage discards a viewport selection instead of
+  // risking a delete against the wrong stage.
+  cancelSelectionSession();
   m_doc.setActive(item->data(0, Qt::UserRole).toInt());
 }
 
@@ -1604,12 +2765,15 @@ void MainWindow::revertToSelectedStage() {
   if (!item || !requireMesh())
     return;
   const int idx = item->data(0, Qt::UserRole).toInt();
+  cancelSelectionSession();
   m_doc.truncateAfter(idx);
   m_visible.clear();
   m_visible.insert(m_doc.activeIndex());
+  refreshView();
 }
 
 void MainWindow::refreshAll() {
+  validateGmshCadState();
   pruneStageSelection();
   validateShrinkState();
   validateSelection();
@@ -1640,9 +2804,14 @@ void MainWindow::rebuildTree() {
                                                        : Qt::Unchecked);
     item->setToolTip(2, QStringLiteral("Include this stage in Combine"));
     const MeshStats s = computeStats(node.mesh);
-    item->setText(1, QStringLiteral("%1 f / %2 bnd")
-                         .arg(s.faces)
-                         .arg(s.boundaryEdges));
+    if (!node.featureEdges.empty()) {
+      item->setText(1,
+                    QStringLiteral("%1 edges").arg(node.featureEdges.edges.size()));
+    } else {
+      item->setText(1, QStringLiteral("%1 f / %2 bnd")
+                           .arg(s.faces)
+                           .arg(s.boundaryEdges));
+    }
     if (kept.contains(i))
       item->setSelected(true);
     if (i == m_doc.activeIndex()) {
@@ -1694,6 +2863,13 @@ void MainWindow::updateStagePanel() {
           .arg(s.bboxMax[0])
           .arg(s.bboxMax[1])
           .arg(s.bboxMax[2]));
+  if (!node.featureEdges.empty()) {
+    m_stageInfo->setText(
+        m_stageInfo->text() +
+        QStringLiteral("\nfeature edges=%1 points=%2")
+            .arg(node.featureEdges.edges.size())
+            .arg(node.featureEdges.points.size()));
+  }
   if (node.leaks.probed) {
     m_leakSummary->setText(
         node.leaks.hasLeak
